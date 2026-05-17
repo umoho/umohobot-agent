@@ -7,8 +7,8 @@ pub struct AgentRequest {
 
 #[derive(Clone, Debug)]
 pub struct AgentResponse {
-    pub draft: String,
-    pub tool_calls: Vec<String>,
+    pub final_text: String,
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -16,6 +16,7 @@ pub struct AgentRuntime {
     provider_label: String,
     model: String,
     user_provider_enabled: bool,
+    max_response_chars: usize,
 }
 
 impl AgentRuntime {
@@ -24,6 +25,7 @@ impl AgentRuntime {
             provider_label: format!("{:?}", config.default_provider.kind),
             model: config.default_provider.model.clone(),
             user_provider_enabled: config.allow_user_provider,
+            max_response_chars: config.max_response_chars,
         }
     }
 
@@ -35,14 +37,29 @@ impl AgentRuntime {
     }
 
     pub fn respond(&self, request: &AgentRequest, tools: &ToolRegistry) -> AgentResponse {
-        let tool_names = tools.names().collect::<Vec<_>>().join(", ");
+        let mut final_text = if request.input.trim().is_empty() {
+            "当前没有收到有效输入，骨架层暂不生成模型回复。".to_string()
+        } else {
+            format!(
+                "已收到消息：{}\n\n这是 Telegram AI Bot 的骨架响应，后续会接入模型、工具和权限层。",
+                request.input
+            )
+        };
+
+        final_text = self.truncate_response(final_text);
+
         AgentResponse {
-            draft: format!("skeleton agent received: {}", request.input),
-            tool_calls: if tool_names.is_empty() {
-                Vec::new()
-            } else {
-                vec![format!("available_tools={tool_names}")]
-            },
+            final_text,
+            notes: vec![
+                format!("provider={}", self.provider_label),
+                format!("model={}", self.model),
+                format!("user_provider_enabled={}", self.user_provider_enabled),
+                format!("registered_tools={}", tools.count()),
+            ],
         }
+    }
+
+    fn truncate_response(&self, text: String) -> String {
+        text.chars().take(self.max_response_chars).collect()
     }
 }

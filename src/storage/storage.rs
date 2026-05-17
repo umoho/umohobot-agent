@@ -22,6 +22,16 @@ pub struct ProviderBinding {
     pub owner_scope: String,
     pub provider_name: String,
     pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub api_key_ref: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConversationRecord {
+    pub conversation_id: String,
+    pub platform: String,
+    pub room_id: String,
+    pub last_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -47,4 +57,10 @@ impl Storage {
     pub fn record_usage(&self, _record: UsageRecord) {}
 
     pub fn record_provider_binding(&self, _binding: ProviderBinding) {}
+
+    pub fn record_conversation(&self, _record: ConversationRecord) {}
+
+    pub fn load_user_profile(&self, _user_id: &str) -> Option<UserProfile> {
+        None
+    }
 }

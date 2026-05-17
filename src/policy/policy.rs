@@ -34,11 +34,8 @@ impl PolicyEngine {
     }
 
     pub fn decide_tool_call(&self, ctx: &ToolCallContext) -> PolicyDecision {
-        match ctx.tool_name.as_str() {
-            "calculator" | "web_search" => PolicyDecision::Allow,
-            other => PolicyDecision::NeedConfirmation {
-                reason: format!("工具 `{other}` 尚未纳入默认放行范围"),
-            },
+        PolicyDecision::NeedConfirmation {
+            reason: format!("工具 `{}` 的执行层尚未接入", ctx.tool_name),
         }
     }
 

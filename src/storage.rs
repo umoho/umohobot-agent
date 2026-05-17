@@ -1,3 +1,3 @@
 pub mod storage;
 
-pub use storage::{ProviderBinding, Storage, UsageRecord, UserProfile};
+pub use storage::{ConversationRecord, ProviderBinding, Storage, UsageRecord, UserProfile};

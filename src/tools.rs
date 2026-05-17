@@ -1,5 +1,3 @@
 pub mod tools;
 
-pub use tools::{
-    CalculatorTool, ToolCall, ToolKind, ToolRegistry, ToolResult, ToolRisk, ToolSpec, WebSearchTool,
-};
+pub use tools::{ToolCall, ToolKind, ToolRegistry, ToolResult, ToolRisk, ToolSpec};

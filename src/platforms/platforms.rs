@@ -56,6 +56,16 @@ pub struct PlatformHub {
     matrix: MatrixTransport,
 }
 
+impl PlatformKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlatformKind::Telegram => "telegram",
+            PlatformKind::Discord => "discord",
+            PlatformKind::Matrix => "matrix",
+        }
+    }
+}
+
 impl TelegramTransport {
     pub fn kind(&self) -> PlatformKind {
         PlatformKind::Telegram
@@ -85,5 +95,13 @@ impl PlatformHub {
             self.discord.kind(),
             self.matrix.kind(),
         ]
+    }
+
+    pub fn describe(&self) -> String {
+        self.supported_kinds()
+            .into_iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
