@@ -7,6 +7,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use tokio::sync::OnceCell;
+use tracing::{debug, info, warn};
 
 use crate::platforms::PlatformKind;
 
@@ -43,6 +44,7 @@ impl SqliteStorage {
 
     async fn pool(&self) -> Result<&SqlitePool, StorageError> {
         let database_path = self.database_path.clone();
+        let database_path_for_log = database_path.display().to_string();
 
         self.pool
             .get_or_try_init(move || async move {
@@ -65,6 +67,10 @@ impl SqliteStorage {
                     .await?;
 
                 MIGRATOR.run(&pool).await?;
+                info!(
+                    database_path = %database_path_for_log,
+                    "sqlite storage initialized"
+                );
                 Ok::<SqlitePool, StorageError>(pool)
             })
             .await
@@ -83,24 +89,69 @@ impl SqliteStorage {
         let now_ms = datetime_to_millis(now);
         let lease_until_ms = option_datetime_to_millis(inbound.lease_until)?;
         let thread_key = inbound.scope.thread_key();
+        debug!(
+            thread_key = %thread_key,
+            platform = %inbound.scope.platform.as_str(),
+            chat_id = %inbound.scope.chat_id,
+            topic_id = %inbound.scope.topic_id.as_deref().unwrap_or("none"),
+            platform_message_id = %inbound.platform_message_id,
+            reply_to_platform_message_id = inbound
+                .reply_to_platform_message_id
+                .as_deref()
+                .unwrap_or("none"),
+            visible_to_model = inbound.visible_to_model,
+            "observing inbound message"
+        );
         let active = self
             .load_active_thread_rows_tx(&mut tx, thread_key.as_str())
             .await?;
         let reusable = select_reusable_active_thread_row(&active, now_ms);
 
         let (thread_row, was_new_thread) = if let Some(thread_row) = reusable {
+            let drained_thread_ids: Vec<i64> = active
+                .iter()
+                .filter(|row| row.id != thread_row.id)
+                .map(|row| row.id)
+                .collect();
             for row in active.iter().filter(|row| row.id != thread_row.id) {
                 self.transition_thread_state_row_tx(&mut tx, row.id, ThreadState::Draining, None)
                     .await?;
+            }
+            if !drained_thread_ids.is_empty() {
+                warn!(
+                    thread_key = %thread_key,
+                    reusable_thread_id = thread_row.id,
+                    drained_thread_ids = ?drained_thread_ids,
+                    "multiple active threads were found; draining stale peers"
+                );
+            } else {
+                debug!(
+                    thread_key = %thread_key,
+                    reusable_thread_id = thread_row.id,
+                    "refreshing active thread"
+                );
             }
             let updated = self
                 .touch_thread_row_tx(&mut tx, thread_row.id, now_ms, lease_until_ms)
                 .await?;
             (updated, false)
         } else {
+            let drained_thread_ids: Vec<i64> = active.iter().map(|row| row.id).collect();
             for row in active.iter() {
                 self.transition_thread_state_row_tx(&mut tx, row.id, ThreadState::Draining, None)
                     .await?;
+            }
+            if drained_thread_ids.is_empty() {
+                info!(
+                    thread_key = %thread_key,
+                    "creating first active thread for scope"
+                );
+            } else {
+                info!(
+                    thread_key = %thread_key,
+                    expired_thread_ids = ?drained_thread_ids,
+                    "creating new thread after active lease expired"
+                );
             }
             let parent = self
                 .load_latest_thread_row_tx(&mut tx, thread_key.as_str())
@@ -125,6 +176,17 @@ impl SqliteStorage {
             .await?;
 
         tx.commit().await?;
+        info!(
+            thread_id = thread_row.id,
+            thread_key = %thread_key_for_row(&thread_row),
+            was_new_thread,
+            thread_state = %thread_row.state.as_str(),
+            turn_count = thread_row.turn_count,
+            summary_cursor = thread_row.summary_cursor,
+            event_id = event_row.id,
+            event_seq = event_row.seq,
+            "inbound message recorded"
+        );
 
         Ok(MessageObservation {
             thread: thread_row.into_record()?,
@@ -141,6 +203,14 @@ impl SqliteStorage {
         let now_ms = option_datetime_to_millis(event.created_at)?;
         let event_row = self.insert_event_tx(&mut tx, event, now_ms).await?;
         tx.commit().await?;
+        info!(
+            thread_id = event_row.thread_id,
+            event_id = event_row.id,
+            event_seq = event_row.seq,
+            kind = %event_row.kind.as_str(),
+            visible_to_model = event_row.visible_to_model,
+            "event appended"
+        );
 
         event_row.into_record()
     }
@@ -222,6 +292,11 @@ impl SqliteStorage {
         };
 
         if thread_update.rows_affected() == 0 {
+            warn!(
+                thread_id = turn.thread_id,
+                trigger_event_id = turn.trigger_event_id,
+                "failed to start turn because thread is not active"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "thread_state",
                 value: "thread is not active".to_string(),
@@ -230,6 +305,17 @@ impl SqliteStorage {
 
         let turn_row = self.load_turn_row_tx(&mut tx, turn_id).await?;
         tx.commit().await?;
+        info!(
+            turn_id = turn_row.id,
+            thread_id = turn_row.thread_id,
+            trigger_event_id = turn_row.trigger_event_id,
+            provider = %turn_row.provider,
+            model = %turn_row.model,
+            prompt_version = turn_row.prompt_version,
+            placeholder_message_id = %turn_row.placeholder_message_id.as_deref().unwrap_or("none"),
+            lease_until = ?turn_row.lease_until,
+            "turn started"
+        );
 
         turn_row.into_record()
     }
@@ -272,6 +358,10 @@ impl SqliteStorage {
         .await?;
 
         if updated.rows_affected() == 0 {
+            warn!(
+                turn_id = turn.turn_id,
+                "failed to update turn because it no longer exists"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "turn_id",
                 value: turn.turn_id.to_string(),
@@ -291,6 +381,11 @@ impl SqliteStorage {
         .await?;
 
         if lease_clear.rows_affected() == 0 {
+            warn!(
+                thread_id = original.thread_id,
+                turn_id = turn.turn_id,
+                "failed to clear thread lease after finishing turn"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "thread_id",
                 value: original.thread_id.to_string(),
@@ -299,6 +394,17 @@ impl SqliteStorage {
 
         let turn_row = self.load_turn_row_tx(&mut tx, turn.turn_id).await?;
         tx.commit().await?;
+        info!(
+            turn_id = turn_row.id,
+            thread_id = turn_row.thread_id,
+            status = %turn_row.status.as_str(),
+            prompt_tokens = turn_row.prompt_tokens,
+            completion_tokens = turn_row.completion_tokens,
+            tool_calls = turn_row.tool_calls,
+            estimated_usage = turn_row.estimated_usage,
+            error_code = %turn_row.error_code.as_deref().unwrap_or("none"),
+            "turn finished"
+        );
 
         turn_row.into_record()
     }
@@ -354,6 +460,11 @@ impl SqliteStorage {
         .await?;
 
         if thread_update.rows_affected() == 0 {
+            warn!(
+                thread_id = summary.thread_id,
+                upto_seq = summary.upto_seq,
+                "failed to advance summary cursor because thread does not exist"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "thread_id",
                 value: summary.thread_id.to_string(),
@@ -362,6 +473,14 @@ impl SqliteStorage {
 
         let summary_row = self.load_summary_row_tx(&mut tx, summary_id).await?;
         tx.commit().await?;
+        info!(
+            summary_id = summary_row.id,
+            thread_id = summary_row.thread_id,
+            upto_seq = summary_row.upto_seq,
+            model = %summary_row.model,
+            prompt_version = summary_row.prompt_version,
+            "summary appended"
+        );
 
         summary_row.into_record()
     }
@@ -455,6 +574,18 @@ impl SqliteStorage {
             .load_usage_totals_row_tx(&mut tx, &usage.scope, usage.provider.as_str())
             .await?;
         tx.commit().await?;
+        info!(
+            scope_kind = %totals_row.scope_kind,
+            scope_id = %totals_row.scope_id,
+            provider = %totals_row.provider,
+            prompt_tokens = totals_row.prompt_tokens,
+            completion_tokens = totals_row.completion_tokens,
+            tool_calls = totals_row.tool_calls,
+            estimated_prompt_tokens = totals_row.estimated_prompt_tokens,
+            estimated_completion_tokens = totals_row.estimated_completion_tokens,
+            estimated_tool_calls = totals_row.estimated_tool_calls,
+            "usage recorded"
+        );
 
         totals_row.into_record()
     }
@@ -470,6 +601,12 @@ impl SqliteStorage {
             .load_active_thread_rows(pool, scope.thread_key().as_str())
             .await?;
         let row = select_reusable_active_thread_row(&rows, datetime_to_millis(Utc::now()));
+        debug!(
+            thread_key = %scope.thread_key(),
+            active_rows = rows.len(),
+            found = row.is_some(),
+            "loaded active thread"
+        );
         row.map(ThreadRow::into_record).transpose()
     }
 
@@ -483,6 +620,11 @@ impl SqliteStorage {
         let row = self
             .load_latest_thread_row(pool, scope.thread_key().as_str())
             .await?;
+        debug!(
+            thread_key = %scope.thread_key(),
+            found = row.is_some(),
+            "loaded latest thread"
+        );
         row.map(ThreadRow::into_record).transpose()
     }
 
@@ -491,8 +633,16 @@ impl SqliteStorage {
         thread_id: i64,
         closed_at: Option<DateTime<Utc>>,
     ) -> Result<ThreadRecord, StorageError> {
-        self.transition_thread_state(thread_id, ThreadState::Closed, closed_at)
-            .await
+        let thread = self
+            .transition_thread_state(thread_id, ThreadState::Closed, closed_at)
+            .await?;
+        info!(
+            thread_id = thread.id,
+            thread_key = %thread.thread_key(),
+            closed_at = ?thread.closed_at,
+            "thread closed"
+        );
+        Ok(thread)
     }
 
     pub async fn drain_thread(
@@ -500,8 +650,15 @@ impl SqliteStorage {
         thread_id: i64,
         drained_at: Option<DateTime<Utc>>,
     ) -> Result<ThreadRecord, StorageError> {
-        self.transition_thread_state(thread_id, ThreadState::Draining, drained_at)
-            .await
+        let thread = self
+            .transition_thread_state(thread_id, ThreadState::Draining, drained_at)
+            .await?;
+        info!(
+            thread_id = thread.id,
+            thread_key = %thread.thread_key(),
+            "thread draining"
+        );
+        Ok(thread)
     }
 
     async fn transition_thread_state(
@@ -520,6 +677,12 @@ impl SqliteStorage {
 
         let thread_row = self.load_thread_row_tx(&mut tx, thread_id).await?;
         tx.commit().await?;
+        debug!(
+            thread_id = thread_row.id,
+            state = %thread_row.state.as_str(),
+            closed_at = ?thread_row.closed_at,
+            "thread state updated"
+        );
 
         thread_row.into_record()
     }
@@ -739,6 +902,11 @@ impl SqliteStorage {
         };
 
         if updated.rows_affected() == 0 {
+            warn!(
+                thread_id = thread_id,
+                state = %state.as_str(),
+                "failed to transition thread state"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "thread_id",
                 value: thread_id.to_string(),
@@ -838,6 +1006,10 @@ impl SqliteStorage {
         };
 
         if updated.rows_affected() == 0 {
+            warn!(
+                thread_id = thread_id,
+                "failed to update thread activity because thread is not active"
+            );
             return Err(StorageError::InvalidValue {
                 kind: "thread_id",
                 value: thread_id.to_string(),
@@ -1285,6 +1457,13 @@ fn u64_to_i64(value: u64) -> Result<i64, StorageError> {
 
 fn i64_to_u64(value: i64) -> Result<u64, StorageError> {
     Ok(u64::try_from(value)?)
+}
+
+fn thread_key_for_row(row: &ThreadRow) -> String {
+    match row.topic_id.as_deref() {
+        Some(topic_id) => format!("{}:{}:topic:{}", row.platform, row.chat_id, topic_id),
+        None => format!("{}:{}", row.platform, row.chat_id),
+    }
 }
 
 fn select_reusable_active_thread_row(rows: &[ThreadRow], now_ms: i64) -> Option<ThreadRow> {

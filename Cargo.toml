@@ -13,3 +13,5 @@ thiserror = "2"
 teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

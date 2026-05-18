@@ -2,6 +2,7 @@ use std::env;
 
 use crate::{
     config::{Config, ProviderKind},
+    logging::sanitize_for_log,
     platforms::PlatformMessage,
     tools::ToolRegistry,
 };
@@ -12,6 +13,7 @@ use rig::{
     providers::{ollama, openai, openrouter},
 };
 use thiserror::Error;
+use tracing::{debug, error, info};
 
 const DEFAULT_PROMPT_PREAMBLE: &str = "你是一个 Telegram AI Bot。输入可能包含正文、附件、回复和@提及等结构化上下文。请结合这些信息使用简洁中文回答，不要输出推理过程。";
 const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
@@ -103,7 +105,7 @@ impl AgentRuntime {
             config.default_provider.api_key_ref.as_deref(),
         )?;
 
-        Ok(Self {
+        let runtime = Self {
             provider_kind,
             provider_backend,
             model: config.default_provider.model.clone(),
@@ -111,7 +113,19 @@ impl AgentRuntime {
             max_response_chars: config.max_response_chars,
             base_url,
             client,
-        })
+        };
+
+        info!(
+            provider = %runtime.provider_backend.as_str(),
+            provider_kind = %runtime.provider_kind.as_str(),
+            model = %runtime.model,
+            base_url = %runtime.base_url,
+            user_provider_enabled = runtime.user_provider_enabled,
+            max_response_chars = runtime.max_response_chars,
+            "agent runtime initialized"
+        );
+
+        Ok(runtime)
     }
 
     pub fn describe(&self) -> String {
@@ -127,11 +141,24 @@ impl AgentRuntime {
     pub async fn respond(&self, request: &AgentRequest, tools: &ToolRegistry) -> AgentResponse {
         let prompt_text = request.prompt_text();
         if prompt_text.trim().is_empty() {
+            debug!(
+                provider = %self.provider_backend.as_str(),
+                model = %self.model,
+                "agent request skipped because prompt was empty"
+            );
             return AgentResponse {
                 final_text: "当前没有收到有效输入，骨架层暂不生成模型回复。".to_string(),
                 notes: self.notes(tools, request, Some("empty_input")),
             };
         }
+
+        info!(
+            provider = %self.provider_backend.as_str(),
+            model = %self.model,
+            input_chars = prompt_text.chars().count(),
+            tool_count = tools.count(),
+            "agent request started"
+        );
 
         let response = match &self.client {
             AgentClient::Ollama(client) => self.query_client(client, &prompt_text).await,
@@ -142,6 +169,16 @@ impl AgentRuntime {
         match response {
             Ok(response) => {
                 let cleaned = strip_think_sections(&response);
+                let response_chars = cleaned.chars().count();
+                let truncated = response_chars > self.max_response_chars;
+
+                info!(
+                    provider = %self.provider_backend.as_str(),
+                    model = %self.model,
+                    response_chars,
+                    truncated,
+                    "agent request completed"
+                );
 
                 AgentResponse {
                     final_text: self.truncate_response(cleaned),
@@ -149,7 +186,17 @@ impl AgentRuntime {
                 }
             }
             Err(err) => AgentResponse {
-                final_text: format!("rig 请求失败：{err}"),
+                final_text: {
+                    let user_message = format!("rig 请求失败：{err}");
+                    error!(
+                        provider = %self.provider_backend.as_str(),
+                        model = %self.model,
+                        error = %sanitize_for_log(&err),
+                        user_message = %sanitize_for_log(&user_message),
+                        "agent request failed"
+                    );
+                    user_message
+                },
                 notes: self.notes(tools, request, Some("provider_error")),
             },
         }

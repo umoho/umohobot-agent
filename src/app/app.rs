@@ -1,12 +1,14 @@
 use crate::{
     agent::{AgentRequest, AgentResponse, AgentRuntime, AgentRuntimeError},
     config::Config,
+    logging::sanitize_for_log,
     platforms::{PlatformKind, PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
     storage::{InboundMessageRecord, Storage, ThreadScope, UsageLedgerRecord, UsageScope},
     tools::ToolRegistry,
 };
 use serde_json::json;
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct ReplyPlan {
@@ -65,6 +67,18 @@ impl App {
         let thread_key = thread_scope.thread_key();
         let mut notes = structured_message_notes(message);
 
+        debug!(
+            platform = %message.platform.as_str(),
+            room_id = %message.room_id,
+            thread_id = %message.thread_id.as_deref().unwrap_or("none"),
+            message_id = %message.message_id,
+            sender_id = %message.sender_id,
+            kind = %message.kind.as_str(),
+            text_present = message.text().is_some(),
+            attachments = message.attachments.len(),
+            "planning message reply"
+        );
+
         match self
             .storage
             .observe_message(InboundMessageRecord {
@@ -86,6 +100,30 @@ impl App {
             .await
         {
             Ok(observation) => {
+                info!(
+                    thread_id = observation.thread.id,
+                    thread_key = %observation.thread.thread_key(),
+                    thread_state = %observation.thread.state.as_str(),
+                    summary_cursor = observation.thread.summary_cursor,
+                    turn_count = observation.thread.turn_count,
+                    event_id = observation.event.id,
+                    event_seq = observation.event.seq,
+                    was_new_thread = observation.was_new_thread,
+                    "message recorded in storage"
+                );
+                if observation.was_new_thread {
+                    info!(
+                        thread_id = observation.thread.id,
+                        thread_key = %observation.thread.thread_key(),
+                        "new thread created"
+                    );
+                } else {
+                    debug!(
+                        thread_id = observation.thread.id,
+                        thread_key = %observation.thread.thread_key(),
+                        "existing thread refreshed"
+                    );
+                }
                 notes.push(format!("thread_id={}", observation.thread.id));
                 notes.push(format!("thread_key={}", observation.thread.thread_key()));
                 notes.push(format!(
@@ -105,6 +143,14 @@ impl App {
                 notes.push(format!("thread_event_seq={}", observation.event.seq));
             }
             Err(err) => {
+                error!(
+                    error = %err,
+                    thread_key = %thread_key,
+                    platform = %message.platform.as_str(),
+                    room_id = %message.room_id,
+                    message_id = %message.message_id,
+                    "failed to observe inbound message"
+                );
                 notes.push(format!("storage_observe_error={err}"));
             }
         }
@@ -117,8 +163,32 @@ impl App {
             .respond(&AgentRequest::new(message.clone()), &self.tools)
             .await;
         notes.append(&mut agent_notes);
+        debug!(
+            provider = %self.agent.describe(),
+            response_chars = agent_text.chars().count(),
+            "agent response ready"
+        );
 
         let quota_decision = self.policy.decide_quota(&QuotaSnapshot::default());
+        match &quota_decision {
+            PolicyDecision::Allow => {
+                debug!(thread_key = %thread_key, "quota allowed");
+            }
+            PolicyDecision::Deny { reason } => {
+                warn!(
+                    thread_key = %thread_key,
+                    user_error = %sanitize_for_log(reason),
+                    "quota denied"
+                );
+            }
+            PolicyDecision::NeedConfirmation { reason } => {
+                warn!(
+                    thread_key = %thread_key,
+                    user_error = %sanitize_for_log(reason),
+                    "quota confirmation required"
+                );
+            }
+        }
         notes.push(format!(
             "quota_decision={}",
             quota_decision_label(&quota_decision)
@@ -138,13 +208,31 @@ impl App {
             })
             .await
         {
+            warn!(
+                error = %err,
+                thread_key = %thread_key,
+                provider = %self.agent.describe(),
+                "failed to record usage"
+            );
             notes.push(format!("storage_usage_error={err}"));
+        } else {
+            debug!(
+                thread_key = %thread_key,
+                provider = %self.agent.describe(),
+                "usage recorded"
+            );
         }
 
         let final_text = match quota_decision {
             PolicyDecision::Allow => agent_text,
             PolicyDecision::Deny { reason } | PolicyDecision::NeedConfirmation { reason } => reason,
         };
+
+        debug!(
+            thread_key = %thread_key,
+            final_text_chars = final_text.chars().count(),
+            "reply plan completed"
+        );
 
         ReplyPlan {
             platform: message.platform,

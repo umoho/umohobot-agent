@@ -1,3 +1,5 @@
+use tracing::{debug, warn};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyDecision {
     Allow,
@@ -34,6 +36,13 @@ impl PolicyEngine {
     }
 
     pub fn decide_tool_call(&self, ctx: &ToolCallContext) -> PolicyDecision {
+        warn!(
+            user_id = %ctx.user_id,
+            room_id = %ctx.room_id,
+            tool_name = %ctx.tool_name,
+            request_chars = ctx.request_summary.chars().count(),
+            "tool call requires confirmation"
+        );
         PolicyDecision::NeedConfirmation {
             reason: format!("工具 `{}` 的执行层尚未接入", ctx.tool_name),
         }
@@ -41,10 +50,23 @@ impl PolicyEngine {
 
     pub fn decide_quota(&self, quota: &QuotaSnapshot) -> PolicyDecision {
         if matches!(quota.remaining_tokens, Some(0)) {
+            warn!(
+                prompt_tokens = quota.prompt_tokens,
+                completion_tokens = quota.completion_tokens,
+                tool_calls = quota.tool_calls,
+                "quota denied"
+            );
             PolicyDecision::Deny {
                 reason: "剩余额度为 0".to_string(),
             }
         } else {
+            debug!(
+                prompt_tokens = quota.prompt_tokens,
+                completion_tokens = quota.completion_tokens,
+                tool_calls = quota.tool_calls,
+                remaining_tokens = ?quota.remaining_tokens,
+                "quota allowed"
+            );
             PolicyDecision::Allow
         }
     }
