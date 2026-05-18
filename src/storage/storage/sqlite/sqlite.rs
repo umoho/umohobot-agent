@@ -3,6 +3,7 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use chrono::{DateTime, Utc};
 use sqlx::{
     FromRow, Sqlite, SqlitePool, Transaction,
+    prelude::Connection,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 use tokio::sync::OnceCell;
@@ -76,21 +77,31 @@ impl SqliteStorage {
         self.ensure_ready().await?;
 
         let pool = self.pool().await?;
-        let mut tx = pool.begin().await?;
+        let mut conn = pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now();
         let now_ms = datetime_to_millis(now);
         let lease_until_ms = option_datetime_to_millis(inbound.lease_until)?;
         let thread_key = inbound.scope.thread_key();
         let active = self
-            .load_active_thread_row_tx(&mut tx, thread_key.as_str())
+            .load_active_thread_rows_tx(&mut tx, thread_key.as_str())
             .await?;
+        let reusable = select_reusable_active_thread_row(&active, now_ms);
 
-        let (thread_row, was_new_thread) = if let Some(thread_row) = active {
+        let (thread_row, was_new_thread) = if let Some(thread_row) = reusable {
+            for row in active.iter().filter(|row| row.id != thread_row.id) {
+                self.transition_thread_state_row_tx(&mut tx, row.id, ThreadState::Draining, None)
+                    .await?;
+            }
             let updated = self
                 .touch_thread_row_tx(&mut tx, thread_row.id, now_ms, lease_until_ms)
                 .await?;
             (updated, false)
         } else {
+            for row in active.iter() {
+                self.transition_thread_state_row_tx(&mut tx, row.id, ThreadState::Draining, None)
+                    .await?;
+            }
             let parent = self
                 .load_latest_thread_row_tx(&mut tx, thread_key.as_str())
                 .await?;
@@ -455,9 +466,10 @@ impl SqliteStorage {
         self.ensure_ready().await?;
 
         let pool = self.pool().await?;
-        let row = self
-            .load_active_thread_row(pool, scope.thread_key().as_str())
+        let rows = self
+            .load_active_thread_rows(pool, scope.thread_key().as_str())
             .await?;
+        let row = select_reusable_active_thread_row(&rows, datetime_to_millis(Utc::now()));
         row.map(ThreadRow::into_record).transpose()
     }
 
@@ -503,61 +515,8 @@ impl SqliteStorage {
         let pool = self.pool().await?;
         let mut tx = pool.begin().await?;
         let timestamp_ms = option_datetime_to_millis(closed_at)?;
-        let updated = match state {
-            ThreadState::Closed => {
-                sqlx::query(
-                    r#"
-                UPDATE threads
-                SET state = ?,
-                    closed_at = ?,
-                    lease_until = NULL,
-                    version = version + 1
-                WHERE id = ?
-                "#,
-                )
-                .bind(state.as_str())
-                .bind(timestamp_ms)
-                .bind(thread_id)
-                .execute(tx.as_mut())
-                .await?
-            }
-            ThreadState::Draining => {
-                sqlx::query(
-                    r#"
-                UPDATE threads
-                SET state = ?,
-                    lease_until = NULL,
-                    version = version + 1
-                WHERE id = ?
-                "#,
-                )
-                .bind(state.as_str())
-                .bind(thread_id)
-                .execute(tx.as_mut())
-                .await?
-            }
-            ThreadState::Active => {
-                sqlx::query(
-                    r#"
-                UPDATE threads
-                SET state = ?,
-                    version = version + 1
-                WHERE id = ?
-                "#,
-                )
-                .bind(state.as_str())
-                .bind(thread_id)
-                .execute(tx.as_mut())
-                .await?
-            }
-        };
-
-        if updated.rows_affected() == 0 {
-            return Err(StorageError::InvalidValue {
-                kind: "thread_id",
-                value: thread_id.to_string(),
-            });
-        }
+        self.transition_thread_state_row_tx(&mut tx, thread_id, state, timestamp_ms)
+            .await?;
 
         let thread_row = self.load_thread_row_tx(&mut tx, thread_id).await?;
         tx.commit().await?;
@@ -565,11 +524,11 @@ impl SqliteStorage {
         thread_row.into_record()
     }
 
-    async fn load_active_thread_row(
+    async fn load_active_thread_rows(
         &self,
         executor: &SqlitePool,
         thread_key: &str,
-    ) -> Result<Option<ThreadRow>, StorageError> {
+    ) -> Result<Vec<ThreadRow>, StorageError> {
         Ok(sqlx::query_as::<_, ThreadRow>(
             r#"
             SELECT
@@ -589,12 +548,11 @@ impl SqliteStorage {
             FROM threads
             WHERE thread_key = ? AND state = ?
             ORDER BY opened_at DESC, id DESC
-            LIMIT 1
             "#,
         )
         .bind(thread_key)
         .bind(ThreadState::Active.as_str())
-        .fetch_optional(executor)
+        .fetch_all(executor)
         .await?)
     }
 
@@ -630,11 +588,11 @@ impl SqliteStorage {
         .await?)
     }
 
-    async fn load_active_thread_row_tx(
+    async fn load_active_thread_rows_tx(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         thread_key: &str,
-    ) -> Result<Option<ThreadRow>, StorageError> {
+    ) -> Result<Vec<ThreadRow>, StorageError> {
         Ok(sqlx::query_as::<_, ThreadRow>(
             r#"
             SELECT
@@ -654,12 +612,11 @@ impl SqliteStorage {
             FROM threads
             WHERE thread_key = ? AND state = ?
             ORDER BY opened_at DESC, id DESC
-            LIMIT 1
             "#,
         )
         .bind(thread_key)
         .bind(ThreadState::Active.as_str())
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await?)
     }
 
@@ -723,6 +680,72 @@ impl SqliteStorage {
         .bind(thread_id)
         .fetch_one(tx.as_mut())
         .await?)
+    }
+
+    async fn transition_thread_state_row_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        thread_id: i64,
+        state: ThreadState,
+        closed_at: Option<i64>,
+    ) -> Result<(), StorageError> {
+        let updated = match state {
+            ThreadState::Closed => {
+                sqlx::query(
+                    r#"
+                UPDATE threads
+                SET state = ?,
+                    closed_at = ?,
+                    lease_until = NULL,
+                    version = version + 1
+                WHERE id = ?
+                "#,
+                )
+                .bind(state.as_str())
+                .bind(closed_at)
+                .bind(thread_id)
+                .execute(tx.as_mut())
+                .await?
+            }
+            ThreadState::Draining => {
+                sqlx::query(
+                    r#"
+                UPDATE threads
+                SET state = ?,
+                    lease_until = NULL,
+                    version = version + 1
+                WHERE id = ?
+                "#,
+                )
+                .bind(state.as_str())
+                .bind(thread_id)
+                .execute(tx.as_mut())
+                .await?
+            }
+            ThreadState::Active => {
+                sqlx::query(
+                    r#"
+                UPDATE threads
+                SET state = ?,
+                    version = version + 1
+                WHERE id = ?
+                "#,
+                )
+                .bind(state.as_str())
+                .bind(thread_id)
+                .execute(tx.as_mut())
+                .await?
+            }
+        };
+
+        if updated.rows_affected() == 0 {
+            return Err(StorageError::InvalidValue {
+                kind: "thread_id",
+                value: thread_id.to_string(),
+            });
+        }
+
+        Ok(())
     }
 
     async fn insert_thread_row_tx(
@@ -1029,7 +1052,7 @@ impl SqliteStorage {
     }
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Clone, Debug, FromRow)]
 struct ThreadRow {
     id: i64,
     platform: String,
@@ -1047,6 +1070,12 @@ struct ThreadRow {
 }
 
 impl ThreadRow {
+    fn is_usable_at(&self, now_ms: i64) -> bool {
+        self.lease_until
+            .map(|lease_until| lease_until > now_ms)
+            .unwrap_or(true)
+    }
+
     fn into_record(self) -> Result<ThreadRecord, StorageError> {
         let platform =
             PlatformKind::from_str(&self.platform).ok_or_else(|| StorageError::InvalidValue {
@@ -1258,9 +1287,14 @@ fn i64_to_u64(value: i64) -> Result<u64, StorageError> {
     Ok(u64::try_from(value)?)
 }
 
+fn select_reusable_active_thread_row(rows: &[ThreadRow], now_ms: i64) -> Option<ThreadRow> {
+    rows.iter().find(|row| row.is_usable_at(now_ms)).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn unique_database_path(prefix: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -1273,24 +1307,40 @@ mod tests {
             .join("state.sqlite3")
     }
 
+    fn inbound_message(
+        scope: ThreadScope,
+        platform_message_id: String,
+        sender_id: String,
+        sender_name: Option<String>,
+        text: String,
+    ) -> InboundMessageRecord {
+        InboundMessageRecord {
+            scope,
+            platform_message_id,
+            sender_id,
+            sender_name,
+            reply_to_platform_message_id: None,
+            content: serde_json::json!({
+                "text": text,
+            }),
+            visible_to_model: true,
+            lease_until: None,
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_storage_tracks_threads_turns_summaries_and_usage() {
         let storage = SqliteStorage::new(unique_database_path("storage-smoke"));
         let scope = ThreadScope::new(PlatformKind::Telegram, "chat-1", Some("42".to_string()));
 
         let observation = storage
-            .observe_message(InboundMessageRecord {
-                scope: scope.clone(),
-                platform_message_id: "msg-1".to_string(),
-                sender_id: "user-1".to_string(),
-                sender_name: Some("Alice".to_string()),
-                reply_to_platform_message_id: None,
-                content: serde_json::json!({
-                    "text": "hello",
-                }),
-                visible_to_model: true,
-                lease_until: None,
-            })
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+            ))
             .await
             .expect("observe message");
 
@@ -1386,5 +1436,150 @@ mod tests {
         assert_eq!(active.summary_cursor, 1);
         assert_eq!(active.turn_count, 1);
         assert!(active.lease_until.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_observe_message_keeps_one_active_thread() {
+        let storage = SqliteStorage::new(unique_database_path("concurrent-observe"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-2", None);
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
+
+        let mut handles = Vec::new();
+        for idx in 0..4 {
+            let storage = storage.clone();
+            let scope = scope.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                storage
+                    .observe_message(inbound_message(
+                        scope,
+                        format!("msg-{idx}"),
+                        format!("user-{idx}"),
+                        Some(format!("User {idx}")),
+                        format!("hello {idx}"),
+                    ))
+                    .await
+                    .expect("observe message")
+            }));
+        }
+
+        let mut observations = Vec::new();
+        for handle in handles {
+            observations.push(handle.await.expect("join"));
+        }
+
+        let thread_id = observations[0].thread.id;
+        assert!(
+            observations
+                .iter()
+                .all(|observation| observation.thread.id == thread_id)
+        );
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.was_new_thread)
+                .count(),
+            1
+        );
+
+        let pool = storage.pool().await.expect("pool");
+        let active_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM threads
+            WHERE thread_key = ? AND state = 'active'
+            "#,
+        )
+        .bind(scope.thread_key().as_str())
+        .fetch_one(pool)
+        .await
+        .expect("count active threads");
+        assert_eq!(active_count, 1);
+
+        let thread_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM threads
+            WHERE thread_key = ?
+            "#,
+        )
+        .bind(scope.thread_key().as_str())
+        .fetch_one(pool)
+        .await
+        .expect("count threads");
+        assert_eq!(thread_count, 1);
+    }
+
+    #[tokio::test]
+    async fn expired_lease_starts_new_thread() {
+        let storage = SqliteStorage::new(unique_database_path("lease-expiry"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-3", None);
+
+        let first = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+            ))
+            .await
+            .expect("observe first message");
+
+        let pool = storage.pool().await.expect("pool");
+        let expired_lease_until = datetime_to_millis(Utc::now() - chrono::Duration::seconds(5));
+        sqlx::query(
+            r#"
+            UPDATE threads
+            SET lease_until = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(expired_lease_until)
+        .bind(first.thread.id)
+        .execute(pool)
+        .await
+        .expect("expire lease");
+
+        let active_before = storage
+            .load_active_thread(&scope)
+            .await
+            .expect("load active thread before expiry");
+        assert!(active_before.is_none());
+
+        let second = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-2".to_string(),
+                "user-2".to_string(),
+                Some("Bob".to_string()),
+                "after timeout".to_string(),
+            ))
+            .await
+            .expect("observe second message");
+
+        assert!(second.was_new_thread);
+        assert_ne!(second.thread.id, first.thread.id);
+
+        let active_after = storage
+            .load_active_thread(&scope)
+            .await
+            .expect("load active thread after expiry")
+            .expect("new active thread");
+        assert_eq!(active_after.id, second.thread.id);
+
+        let old_state: String = sqlx::query_scalar(
+            r#"
+            SELECT state
+            FROM threads
+            WHERE id = ?
+            "#,
+        )
+        .bind(first.thread.id)
+        .fetch_one(pool)
+        .await
+        .expect("load old thread state");
+        assert_eq!(old_state, "draining");
     }
 }
