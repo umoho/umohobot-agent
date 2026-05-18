@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rig-core = "0.31"
+serde = { version = "1", features = ["derive"] }
+teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "rustls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

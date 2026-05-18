@@ -70,6 +70,10 @@ impl TelegramTransport {
     pub fn kind(&self) -> PlatformKind {
         PlatformKind::Telegram
     }
+
+    pub fn supports_placeholder_edit_flow(&self) -> bool {
+        true
+    }
 }
 
 impl DiscordTransport {
@@ -89,6 +93,10 @@ impl PlatformHub {
         Self::default()
     }
 
+    pub fn supports_placeholder_edit_flow(&self) -> bool {
+        self.telegram.supports_placeholder_edit_flow()
+    }
+
     pub fn supported_kinds(&self) -> Vec<PlatformKind> {
         vec![
             self.telegram.kind(),
@@ -105,3 +113,10 @@ impl PlatformHub {
             .join(", ")
     }
 }
+
+pub mod telegram;
+
+pub use telegram::{
+    TelegramInboundMessage, TelegramReplyScript, TelegramReplyStep, TelegramRuntime,
+    TelegramRuntimeConfig,
+};

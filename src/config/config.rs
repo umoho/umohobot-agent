@@ -32,6 +32,7 @@ pub struct Config {
     pub default_provider: ProviderConfig,
     pub allow_user_provider: bool,
     pub max_response_chars: usize,
+    pub message_edit_throttle_ms: u64,
     pub placeholder_text: String,
 }
 
@@ -52,16 +53,23 @@ impl Config {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(4_000);
+        let message_edit_throttle_ms = env::var("MESSAGE_EDIT_THROTTLE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(750);
         let placeholder_text =
             env::var("PLACEHOLDER_TEXT").unwrap_or_else(|_| "正在处理...".to_string());
 
         Self {
             bot_name,
             runtime_mode,
-            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),
+            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
+                .ok()
+                .or_else(|| env::var("TELOXIDE_TOKEN").ok()),
             default_provider,
             allow_user_provider,
             max_response_chars,
+            message_edit_throttle_ms,
             placeholder_text,
         }
     }
@@ -75,8 +83,16 @@ impl ProviderConfig {
             Some("custom") => ProviderKind::Custom,
             _ => ProviderKind::Ollama,
         };
-        let base_url = env::var("DEFAULT_BASE_URL").ok();
-        let model = env::var("DEFAULT_MODEL").unwrap_or_else(|_| "llama3.1".to_string());
+        let base_url = env::var("DEFAULT_BASE_URL").ok().or_else(|| {
+            matches!(kind, ProviderKind::Ollama).then(|| "http://127.0.0.1:11434".to_string())
+        });
+        let model = env::var("DEFAULT_MODEL").unwrap_or_else(|_| {
+            if matches!(kind, ProviderKind::Ollama) {
+                "deepseek-r1:8b".to_string()
+            } else {
+                "llama3.1".to_string()
+            }
+        });
         let api_key_env = env::var("DEFAULT_API_KEY_ENV").ok();
 
         Self {

@@ -216,9 +216,9 @@
 
 ### 阶段 1：MVP
 
-- Telegram 接入。
+- Telegram 实时收发入口。
 - 占位消息 + 编辑回复。
-- `rig` agent 接入。
+- agent/runtime 基础链路，默认接本机 Ollama DeepSeek。
 - 工具接口占位，不实现具体工具。
 - 用量统计与超量切断。
 

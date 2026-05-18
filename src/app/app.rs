@@ -16,7 +16,7 @@ pub struct ReplyPlan {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct App {
     config: Config,
     storage: Storage,
@@ -46,20 +46,24 @@ impl App {
 
     pub fn describe(&self) -> String {
         format!(
-            "bot={} provider={} platforms={}",
+            "bot={} provider={} platforms={} placeholder_edit_flow={}",
             self.config.bot_name,
             self.agent.describe(),
-            self.platforms.describe()
+            self.platforms.describe(),
+            self.platforms.supports_placeholder_edit_flow()
         )
     }
 
-    pub fn plan_message(&self, message: &PlatformMessage) -> ReplyPlan {
-        let response = self.agent.respond(
-            &AgentRequest {
-                input: message.text.clone(),
-            },
-            &self.tools,
-        );
+    pub async fn plan_message(&self, message: &PlatformMessage) -> ReplyPlan {
+        let response = self
+            .agent
+            .respond(
+                &AgentRequest {
+                    input: message.text.clone(),
+                },
+                &self.tools,
+            )
+            .await;
         let quota_decision = self.policy.decide_quota(&QuotaSnapshot::default());
 
         self.storage.record_conversation(ConversationRecord {
@@ -99,9 +103,6 @@ impl App {
     }
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = Config::load();
-    let app = App::new(config);
-    app.run();
-    Ok(())
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::runtime::run().await
 }
