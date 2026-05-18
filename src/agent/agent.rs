@@ -181,6 +181,7 @@ mod tests {
         let request = AgentRequest::new(PlatformMessage {
             platform: PlatformKind::Telegram,
             room_id: "room".to_string(),
+            thread_id: None,
             message_id: "msg".to_string(),
             sender_id: "user".to_string(),
             kind: PlatformMessageKind::Text,
@@ -201,6 +202,7 @@ mod tests {
         let request = AgentRequest::new(PlatformMessage {
             platform: PlatformKind::Telegram,
             room_id: "room".to_string(),
+            thread_id: None,
             message_id: "msg".to_string(),
             sender_id: "user".to_string(),
             kind: PlatformMessageKind::Photo,

@@ -72,6 +72,7 @@ pub struct ReplyMetadata {
 pub struct PlatformMessage {
     pub platform: PlatformKind,
     pub room_id: String,
+    pub thread_id: Option<String>,
     pub message_id: String,
     pub sender_id: String,
     pub kind: PlatformMessageKind,
@@ -110,6 +111,15 @@ impl PlatformKind {
             PlatformKind::Telegram => "telegram",
             PlatformKind::Discord => "discord",
             PlatformKind::Matrix => "matrix",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "telegram" => Some(PlatformKind::Telegram),
+            "discord" => Some(PlatformKind::Discord),
+            "matrix" => Some(PlatformKind::Matrix),
+            _ => None,
         }
     }
 }

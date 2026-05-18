@@ -47,6 +47,7 @@ pub enum TelegramReplyStep {
 pub struct TelegramReplyScript {
     pub platform: PlatformKind,
     pub room_id: String,
+    pub thread_id: Option<String>,
     pub placeholder_text: String,
     pub final_text: String,
     pub edit_in_place: bool,
@@ -57,6 +58,7 @@ pub struct TelegramReplyScript {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TelegramInboundMessage {
     pub room_id: String,
+    pub thread_id: Option<String>,
     pub message_id: String,
     pub sender_id: String,
     pub kind: PlatformMessageKind,
@@ -96,6 +98,7 @@ impl TelegramRuntime {
 
         TelegramInboundMessage {
             room_id: message.chat.id.to_string(),
+            thread_id: message.thread_id.map(|thread_id| thread_id.0.to_string()),
             message_id: message.id.to_string(),
             sender_id: snapshot.sender_id,
             kind: snapshot.kind,
@@ -120,6 +123,7 @@ impl TelegramRuntime {
         TelegramReplyScript {
             platform: plan.platform.clone(),
             room_id: plan.room_id.clone(),
+            thread_id: plan.thread_id.clone(),
             placeholder_text: placeholder_text.clone(),
             final_text: plan.final_text.clone(),
             edit_in_place: true,
@@ -152,6 +156,7 @@ impl From<TelegramInboundMessage> for PlatformMessage {
         Self {
             platform: PlatformKind::Telegram,
             room_id: inbound.room_id,
+            thread_id: inbound.thread_id,
             message_id: inbound.message_id,
             sender_id: inbound.sender_id,
             kind: inbound.kind,
@@ -412,6 +417,7 @@ mod tests {
         let script = runtime.build_reply_script(&ReplyPlan {
             platform: PlatformKind::Telegram,
             room_id: "room".to_string(),
+            thread_id: None,
             placeholder_text: String::new(),
             final_text: "done".to_string(),
             notes: Vec::new(),
@@ -439,6 +445,7 @@ mod tests {
         });
         let inbound = TelegramInboundMessage {
             room_id: "room".to_string(),
+            thread_id: None,
             message_id: "msg-1".to_string(),
             sender_id: "user-1".to_string(),
             kind: PlatformMessageKind::Photo,

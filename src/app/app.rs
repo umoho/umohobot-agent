@@ -3,14 +3,16 @@ use crate::{
     config::Config,
     platforms::{PlatformKind, PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
-    storage::{ConversationRecord, Storage, UsageRecord},
+    storage::{InboundMessageRecord, Storage, ThreadScope, UsageLedgerRecord, UsageScope},
     tools::ToolRegistry,
 };
+use serde_json::json;
 
 #[derive(Clone, Debug)]
 pub struct ReplyPlan {
     pub platform: PlatformKind,
     pub room_id: String,
+    pub thread_id: Option<String>,
     pub placeholder_text: String,
     pub final_text: String,
     pub notes: Vec<String>,
@@ -55,14 +57,62 @@ impl App {
     }
 
     pub async fn plan_message(&self, message: &PlatformMessage) -> ReplyPlan {
+        let thread_scope = ThreadScope::from_platform_message(message);
+        let thread_key = thread_scope.thread_key();
+        let mut notes = structured_message_notes(message);
+
+        match self
+            .storage
+            .observe_message(InboundMessageRecord {
+                scope: thread_scope.clone(),
+                platform_message_id: message.message_id.clone(),
+                sender_id: message.sender_id.clone(),
+                sender_name: None,
+                reply_to_platform_message_id: message
+                    .reply
+                    .as_ref()
+                    .map(|reply| reply.message_id.clone()),
+                content: platform_message_content(message),
+                visible_to_model: !matches!(
+                    message.kind,
+                    crate::platforms::PlatformMessageKind::Service
+                ),
+                lease_until: None,
+            })
+            .await
+        {
+            Ok(observation) => {
+                notes.push(format!("thread_id={}", observation.thread.id));
+                notes.push(format!("thread_key={}", observation.thread.thread_key()));
+                notes.push(format!(
+                    "thread_state={}",
+                    observation.thread.state.as_str()
+                ));
+                notes.push(format!(
+                    "thread_turn_count={}",
+                    observation.thread.turn_count
+                ));
+                notes.push(format!(
+                    "thread_summary_cursor={}",
+                    observation.thread.summary_cursor
+                ));
+                notes.push(format!("thread_new={}", observation.was_new_thread));
+                notes.push(format!("thread_event_id={}", observation.event.id));
+                notes.push(format!("thread_event_seq={}", observation.event.seq));
+            }
+            Err(err) => {
+                notes.push(format!("storage_observe_error={err}"));
+            }
+        }
+
         let AgentResponse {
             final_text: agent_text,
-            mut notes,
+            notes: mut agent_notes,
         } = self
             .agent
             .respond(&AgentRequest::new(message.clone()), &self.tools)
             .await;
-        notes.extend(structured_message_notes(message));
+        notes.append(&mut agent_notes);
 
         let quota_decision = self.policy.decide_quota(&QuotaSnapshot::default());
         notes.push(format!(
@@ -70,20 +120,22 @@ impl App {
             quota_decision_label(&quota_decision)
         ));
 
-        self.storage.record_conversation(ConversationRecord {
-            conversation_id: format!("{}:{}", message.platform.as_str(), message.room_id),
-            platform: message.platform.as_str().to_string(),
-            room_id: message.room_id.clone(),
-            last_message_id: Some(message.message_id.clone()),
-        });
-        self.storage.record_usage(UsageRecord {
-            scope: message.room_id.clone(),
-            provider: self.agent.describe(),
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-            estimated: true,
-        });
+        if let Err(err) = self
+            .storage
+            .record_usage(UsageLedgerRecord {
+                scope: UsageScope::thread(thread_key.to_string()),
+                provider: self.agent.describe(),
+                turn_id: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                estimated: true,
+                created_at: None,
+            })
+            .await
+        {
+            notes.push(format!("storage_usage_error={err}"));
+        }
 
         let final_text = match quota_decision {
             PolicyDecision::Allow => agent_text,
@@ -93,6 +145,7 @@ impl App {
         ReplyPlan {
             platform: message.platform,
             room_id: message.room_id.clone(),
+            thread_id: message.thread_id.clone(),
             placeholder_text: self.config.placeholder_text.clone(),
             final_text,
             notes,
@@ -115,6 +168,10 @@ fn structured_message_notes(message: &PlatformMessage) -> Vec<String> {
     vec![
         format!("input_platform={}", message.platform.as_str()),
         format!("input_room_id={}", message.room_id),
+        format!(
+            "input_thread_id={}",
+            message.thread_id.as_deref().unwrap_or("none")
+        ),
         format!("input_message_kind={}", message.kind.as_str()),
         format!("input_body_kind={}", message.body.kind_label()),
         format!("input_text_present={}", message.text().is_some()),
@@ -131,6 +188,65 @@ fn quota_decision_label(decision: &PolicyDecision) -> &'static str {
         PolicyDecision::Deny { .. } => "deny",
         PolicyDecision::NeedConfirmation { .. } => "need_confirmation",
     }
+}
+
+fn platform_message_content(message: &PlatformMessage) -> serde_json::Value {
+    json!({
+        "platform": message.platform.as_str(),
+        "room_id": message.room_id.as_str(),
+        "thread_id": message.thread_id.as_deref(),
+        "message_id": message.message_id.as_str(),
+        "sender_id": message.sender_id.as_str(),
+        "kind": message.kind.as_str(),
+        "body_kind": message.body.kind_label(),
+        "text": message.text(),
+        "entities": message
+            .body_entities()
+            .iter()
+            .map(|entity| json!({
+                "kind": format!("{:?}", entity.kind.clone()),
+                "text": entity.text.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+        "attachments": message
+            .attachments
+            .iter()
+            .map(|attachment| json!({
+                "kind": attachment.kind.as_str(),
+                "file_id": attachment.file_id.as_deref(),
+                "file_unique_id": attachment.file_unique_id.as_deref(),
+                "file_name": attachment.file_name.as_deref(),
+                "mime_type": attachment.mime_type.as_deref(),
+                "url": attachment.url.as_deref(),
+                "width": attachment.width,
+                "height": attachment.height,
+                "size_bytes": attachment.size_bytes,
+            }))
+            .collect::<Vec<_>>(),
+        "reply": message.reply.as_ref().map(|reply| json!({
+            "message_id": reply.message_id.as_str(),
+            "sender_id": reply.sender_id.as_str(),
+            "kind": reply.kind.as_str(),
+            "body_kind": reply.body.kind_label(),
+            "text": reply.body.text(),
+            "attachments": reply
+                .attachments
+                .iter()
+                .map(|attachment| json!({
+                    "kind": attachment.kind.as_str(),
+                    "file_id": attachment.file_id.as_deref(),
+                    "file_unique_id": attachment.file_unique_id.as_deref(),
+                    "file_name": attachment.file_name.as_deref(),
+                    "mime_type": attachment.mime_type.as_deref(),
+                    "url": attachment.url.as_deref(),
+                    "width": attachment.width,
+                    "height": attachment.height,
+                    "size_bytes": attachment.size_bytes,
+                }))
+                .collect::<Vec<_>>(),
+        })),
+        "is_mention": message.is_mention,
+    })
 }
 
 #[cfg(test)]
@@ -172,6 +288,7 @@ mod tests {
         let message = PlatformMessage {
             platform: PlatformKind::Telegram,
             room_id: "room".to_string(),
+            thread_id: None,
             message_id: "msg".to_string(),
             sender_id: "user".to_string(),
             kind: PlatformMessageKind::Photo,

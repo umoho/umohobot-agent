@@ -5,7 +5,9 @@ use crate::{
     config::{Config, RuntimeMode},
     platforms::{PlatformMessage, Platforms, TelegramReplyScript, TelegramRuntime},
 };
+use teloxide::payloads::SendMessageSetters;
 use teloxide::prelude::Requester;
+use teloxide::types::{MessageId, ThreadId};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSummary {
@@ -75,10 +77,15 @@ impl RuntimeController {
 
                     let inbound = telegram.inbound_from_message(&msg);
                     let platform_message = telegram.normalize_inbound(inbound);
-                    let placeholder = bot
-                        .send_message(msg.chat.id, telegram.placeholder_text().to_string())
-                        .await?;
+                    let thread_id = platform_message.thread_id.clone();
+                    let mut placeholder_request =
+                        bot.send_message(msg.chat.id, telegram.placeholder_text().to_string());
+                    if let Some(thread_id) = parse_thread_id(thread_id.as_deref()) {
+                        placeholder_request = placeholder_request.message_thread_id(thread_id);
+                    }
+                    let placeholder = placeholder_request.await?;
                     let reply_plan = app.plan_message(&platform_message).await;
+                    let thread_id = reply_plan.thread_id.clone().or(thread_id);
 
                     let script = telegram.build_reply_script(&reply_plan);
                     if script.edit_in_place {
@@ -94,11 +101,21 @@ impl RuntimeController {
                             Err(err) => {
                                 let fallback_text =
                                     format!("{}\n\n(编辑失败：{err})", script.final_text);
-                                let _ = bot.send_message(msg.chat.id, fallback_text).await?;
+                                let mut fallback_request =
+                                    bot.send_message(msg.chat.id, fallback_text);
+                                if let Some(thread_id) = parse_thread_id(thread_id.as_deref()) {
+                                    fallback_request =
+                                        fallback_request.message_thread_id(thread_id);
+                                }
+                                let _ = fallback_request.await?;
                             }
                         }
                     } else {
-                        let _ = bot.send_message(msg.chat.id, script.final_text).await?;
+                        let mut send_request = bot.send_message(msg.chat.id, script.final_text);
+                        if let Some(thread_id) = parse_thread_id(thread_id.as_deref()) {
+                            send_request = send_request.message_thread_id(thread_id);
+                        }
+                        let _ = send_request.await?;
                     }
 
                     Ok(())
@@ -115,6 +132,12 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = Config::load()?;
     let runtime = RuntimeController::new(config);
     runtime.run().await
+}
+
+fn parse_thread_id(value: Option<&str>) -> Option<ThreadId> {
+    value
+        .and_then(|value| value.parse::<i32>().ok())
+        .map(|id| ThreadId(MessageId(id)))
 }
 
 #[cfg(test)]
