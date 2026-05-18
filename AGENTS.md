@@ -74,6 +74,7 @@
 - thread 关闭后只标记为 `closed`，不要删历史。
 - thread 的事实记录用 append-only event，`threads`、`turns`、`summaries`、`usage_totals` 属于派生状态。
 - 新 thread 可以继承上一 thread 的摘要，但不要继承完整历史。
+- 第一版存储后端先做 SQLite，但要保留 storage 抽象层，业务层不要直接依赖 SQLite 细节。
 
 ## Prompt 要求
 

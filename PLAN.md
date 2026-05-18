@@ -38,7 +38,7 @@
 
 4. 数据与配置层
    - 负责 thread、turn、event、用户设置、provider 配置、用量账本、授权记录。
-   - 建议使用 SQLite 起步，后续可迁移到 PostgreSQL。
+   - 当前第一版使用 SQLite，并保留 storage 抽象层，后续可替换后端。
    - 线程、存储和 prompt contract 的详细约定见 `DESIGN.md`。
 
 ## 4. 消息生命周期

@@ -112,7 +112,8 @@ thread 结束条件建议包括：
 
 ## 4. 存储设计
 
-建议起步使用 SQLite，并通过 `sqlx` 管理迁移。
+当前第一版实现使用 SQLite，并通过 `sqlx` 管理迁移。
+同时要保留 storage 抽象层，让业务层只依赖仓储接口，不直接绑定到 SQLite 细节。
 
 ### 4.1 设计原则
 
@@ -230,6 +231,7 @@ thread 内的原子事实流。
 - 后台任务至少两个：
   - reaper：关闭过期且无 lease 的 thread。
   - summarizer：压缩过长 thread 的历史。
+- 具体后端先实现 SQLite，后续如果需要切换数据库，只替换 storage backend，不改上层调用。
 
 ## 5. Prompt Contract
 
