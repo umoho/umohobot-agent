@@ -254,3 +254,20 @@
 - 对应实现放在 `src/<name>/<name>.rs`。
 - 如果继续拆分子模块，也沿用同样的同名目录 + 同名文件方式递归展开。
 - `lib.rs` 和 `main.rs` 作为入口文件保留，不使用 `mod.rs` 作为任何层级的入口。
+
+## 14. 配置文件项目
+
+运行参数必须外置到配置文件，不允许把模型名、provider 选择、Telegram bot token 之类的运行信息硬编码进 Rust 源码。
+
+- 默认使用 `config.toml` 作为运行配置。
+- 仓库内提供 `config.example.toml` 作为模板。
+- 本地真实配置文件 `config.toml` 不应提交到仓库。
+- 环境变量可以作为覆盖层，但不能替代配置文件的主体结构。
+- 配置文件应覆盖：
+  - bot 名称
+  - 运行模式
+  - 默认 provider
+  - provider 的 `base_url` / `model` / `api_key_ref`
+  - 存储目录
+  - 编辑节流、占位文本等运行参数
+- Telegram bot token 单独通过环境变量注入，例如 `TELEGRAM_BOT_TOKEN` 或 `TELOXIDE_TOKEN`，不要写入配置文件。

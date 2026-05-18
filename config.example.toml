@@ -1,0 +1,18 @@
+[app]
+bot_name = "umohobot"
+runtime_mode = "telegram"
+allow_user_provider = false
+max_response_chars = 4000
+message_edit_throttle_ms = 750
+placeholder_text = "正在处理..."
+
+[provider]
+# 可选值：ollama / openai_compatible / openai / custom
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "deepseek-r1:8b"
+# 如果 provider 需要 API Key，可以再取消注释并填写环境变量名
+# api_key_ref = "OPENAI_API_KEY"
+
+[storage]
+data_dir = "./data"

@@ -40,9 +40,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new() -> Self {
+    pub fn new(data_dir: Option<PathBuf>) -> Self {
         Self {
-            data_dir: env::var("DATA_DIR").ok().map(PathBuf::from),
+            data_dir: data_dir.or_else(|| env::var("DATA_DIR").ok().map(PathBuf::from)),
         }
     }
 

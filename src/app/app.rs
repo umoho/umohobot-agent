@@ -28,7 +28,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
-        let storage = Storage::new();
+        let storage = Storage::new(config.data_dir.clone());
         let policy = PolicyEngine::new();
         let tools = ToolRegistry::new();
         let agent = AgentRuntime::new(&config);

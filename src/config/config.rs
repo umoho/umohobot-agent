@@ -1,6 +1,13 @@
-use std::env;
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
-#[derive(Clone, Debug)]
+use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RuntimeMode {
     Telegram,
     Discord,
@@ -8,11 +15,15 @@ pub enum RuntimeMode {
     Local,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 pub enum ProviderKind {
+    #[serde(rename = "ollama")]
     Ollama,
+    #[serde(rename = "openai_compatible")]
     OpenAICompatible,
+    #[serde(rename = "openai")]
     OpenAI,
+    #[serde(rename = "custom")]
     Custom,
 }
 
@@ -21,7 +32,7 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub model: String,
-    pub api_key_env: Option<String>,
+    pub api_key_ref: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -34,72 +45,238 @@ pub struct Config {
     pub max_response_chars: usize,
     pub message_edit_throttle_ms: u64,
     pub placeholder_text: String,
+    pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("无法读取配置文件 {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("无法解析配置文件 {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error(
+        "配置文件 {path} 缺少必要字段: {missing}。Telegram token 需要通过环境变量 TELEGRAM_BOT_TOKEN 或 TELOXIDE_TOKEN 提供。请复制 config.example.toml 为 config.toml 并填写。"
+    )]
+    Missing { path: PathBuf, missing: String },
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct FileConfig {
+    app: AppFileConfig,
+    provider: ProviderFileConfig,
+    storage: StorageFileConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct AppFileConfig {
+    bot_name: Option<String>,
+    runtime_mode: Option<RuntimeMode>,
+    allow_user_provider: Option<bool>,
+    max_response_chars: Option<usize>,
+    message_edit_throttle_ms: Option<u64>,
+    placeholder_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct ProviderFileConfig {
+    kind: Option<ProviderKind>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct StorageFileConfig {
+    data_dir: Option<PathBuf>,
 }
 
 impl Config {
-    pub fn load() -> Self {
-        let bot_name = env::var("BOT_NAME").unwrap_or_else(|_| "umohobot".to_string());
-        let runtime_mode = match env::var("RUNTIME_MODE").ok().as_deref() {
-            Some("discord") => RuntimeMode::Discord,
-            Some("matrix") => RuntimeMode::Matrix,
-            Some("local") => RuntimeMode::Local,
-            _ => RuntimeMode::Telegram,
-        };
-        let default_provider = ProviderConfig::load();
-        let allow_user_provider = env::var("ALLOW_USER_PROVIDER")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-        let max_response_chars = env::var("MAX_RESPONSE_CHARS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(4_000);
-        let message_edit_throttle_ms = env::var("MESSAGE_EDIT_THROTTLE_MS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(750);
-        let placeholder_text =
-            env::var("PLACEHOLDER_TEXT").unwrap_or_else(|_| "正在处理...".to_string());
+    pub fn load() -> Result<Self, ConfigError> {
+        let (config_path, explicit) = Self::resolve_config_path();
+        let file = Self::load_file(&config_path, explicit)?;
 
-        Self {
+        Self::from_sources(config_path, file)
+    }
+
+    fn from_sources(config_path: PathBuf, file: FileConfig) -> Result<Self, ConfigError> {
+        let bot_name = env_string("BOT_NAME")
+            .or(file.app.bot_name)
+            .unwrap_or_else(|| "umohobot".to_string());
+        let runtime_mode = env_runtime_mode()
+            .or(file.app.runtime_mode)
+            .unwrap_or(RuntimeMode::Telegram);
+        let telegram_bot_token =
+            env_string("TELEGRAM_BOT_TOKEN").or_else(|| env_string("TELOXIDE_TOKEN"));
+        let allow_user_provider = env_bool("ALLOW_USER_PROVIDER")
+            .or(file.app.allow_user_provider)
+            .unwrap_or(false);
+        let max_response_chars = env_usize("MAX_RESPONSE_CHARS")
+            .or(file.app.max_response_chars)
+            .unwrap_or(4_000);
+        let message_edit_throttle_ms = env_u64("MESSAGE_EDIT_THROTTLE_MS")
+            .or(file.app.message_edit_throttle_ms)
+            .unwrap_or(750);
+        let placeholder_text = env_string("PLACEHOLDER_TEXT")
+            .or(file.app.placeholder_text)
+            .unwrap_or_else(|| "正在处理...".to_string());
+        let provider_kind = env_provider_kind()
+            .or_else(|| env_legacy_provider_kind())
+            .or(file.provider.kind);
+        let provider_model = env_string("DEFAULT_MODEL").or(file.provider.model);
+        let provider_base_url = env_string("DEFAULT_BASE_URL")
+            .or(file.provider.base_url)
+            .or_else(|| {
+                matches!(provider_kind, Some(ProviderKind::Ollama))
+                    .then(|| "http://127.0.0.1:11434".to_string())
+            });
+        let api_key_ref = env_string("DEFAULT_API_KEY_REF")
+            .or_else(|| env_string("DEFAULT_API_KEY_ENV"))
+            .or(file.provider.api_key_ref);
+        let data_dir = env_string("DATA_DIR")
+            .map(PathBuf::from)
+            .or(file.storage.data_dir);
+
+        let mut missing = Vec::new();
+        if provider_kind.is_none() {
+            missing.push("provider.kind");
+        }
+        if provider_model
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            missing.push("provider.model");
+        }
+        if matches!(runtime_mode, RuntimeMode::Telegram) && telegram_bot_token.is_none() {
+            missing.push("telegram.bot_token");
+        }
+
+        if !missing.is_empty() {
+            return Err(ConfigError::Missing {
+                path: config_path,
+                missing: missing.join(", "),
+            });
+        }
+
+        Ok(Self {
             bot_name,
             runtime_mode,
-            telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN")
-                .ok()
-                .or_else(|| env::var("TELOXIDE_TOKEN").ok()),
-            default_provider,
+            telegram_bot_token,
+            default_provider: ProviderConfig {
+                kind: provider_kind.expect("validated above"),
+                base_url: provider_base_url,
+                model: provider_model.expect("validated above"),
+                api_key_ref,
+            },
             allow_user_provider,
             max_response_chars,
             message_edit_throttle_ms,
             placeholder_text,
+            data_dir,
+        })
+    }
+
+    fn resolve_config_path() -> (PathBuf, bool) {
+        env::var("UMOHOBOT_CONFIG")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .map(|path| (path, true))
+            .unwrap_or_else(|| (PathBuf::from("config.toml"), false))
+    }
+
+    fn load_file(path: &Path, explicit: bool) -> Result<FileConfig, ConfigError> {
+        if !path.exists() {
+            if explicit {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source: io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "通过 UMOHOBOT_CONFIG 指定的配置文件不存在",
+                    ),
+                });
+            }
+            return Ok(FileConfig::default());
+        }
+
+        let raw = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+}
+
+impl ProviderKind {
+    fn from_env(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "ollama" => Some(Self::Ollama),
+            "openai_compatible" | "openai-compatible" | "compat" => Some(Self::OpenAICompatible),
+            "openai" => Some(Self::OpenAI),
+            "custom" => Some(Self::Custom),
+            _ => None,
         }
     }
 }
 
-impl ProviderConfig {
-    fn load() -> Self {
-        let kind = match env::var("DEFAULT_PROVIDER").ok().as_deref() {
-            Some("openai") => ProviderKind::OpenAI,
-            Some("compat") => ProviderKind::OpenAICompatible,
-            Some("custom") => ProviderKind::Custom,
-            _ => ProviderKind::Ollama,
-        };
-        let base_url = env::var("DEFAULT_BASE_URL").ok().or_else(|| {
-            matches!(kind, ProviderKind::Ollama).then(|| "http://127.0.0.1:11434".to_string())
-        });
-        let model = env::var("DEFAULT_MODEL").unwrap_or_else(|_| {
-            if matches!(kind, ProviderKind::Ollama) {
-                "deepseek-r1:8b".to_string()
-            } else {
-                "llama3.1".to_string()
-            }
-        });
-        let api_key_env = env::var("DEFAULT_API_KEY_ENV").ok();
-
-        Self {
-            kind,
-            base_url,
-            model,
-            api_key_env,
+impl RuntimeMode {
+    fn from_env(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "telegram" => Some(Self::Telegram),
+            "discord" => Some(Self::Discord),
+            "matrix" => Some(Self::Matrix),
+            "local" => Some(Self::Local),
+            _ => None,
         }
     }
+}
+
+fn env_string(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    env::var(key)
+        .ok()
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
+}
+
+fn env_runtime_mode() -> Option<RuntimeMode> {
+    env_string("RUNTIME_MODE").and_then(|value| RuntimeMode::from_env(&value))
+}
+
+fn env_provider_kind() -> Option<ProviderKind> {
+    env_string("DEFAULT_PROVIDER_KIND").and_then(|value| ProviderKind::from_env(&value))
+}
+
+fn env_legacy_provider_kind() -> Option<ProviderKind> {
+    env_string("DEFAULT_PROVIDER").and_then(|value| ProviderKind::from_env(&value))
 }

@@ -112,7 +112,7 @@ impl RuntimeController {
 }
 
 pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let config = Config::load();
+    let config = Config::load()?;
     let runtime = RuntimeController::new(config);
     runtime.run().await
 }
@@ -132,12 +132,13 @@ mod tests {
                 kind: ProviderKind::Ollama,
                 base_url: None,
                 model: "llama3.1".to_string(),
-                api_key_env: None,
+                api_key_ref: None,
             },
             allow_user_provider: false,
             max_response_chars: 4_000,
             message_edit_throttle_ms: 750,
             placeholder_text: "正在处理...".to_string(),
+            data_dir: None,
         };
         let runtime = RuntimeController::new(config);
         let summary = runtime.summary();
