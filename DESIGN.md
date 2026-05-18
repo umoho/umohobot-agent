@@ -53,13 +53,33 @@ event 是 thread 中的原子事实记录。
 
 event 应尽量 append-only，作为审计和回放的事实来源。
 
-### 2.5 lease
+### 2.5 thread lease
 
-lease 是 turn 持有 thread 的短期租约。
+thread lease 表示“这个会话 thread 还处于活跃窗口内”。
 
-- 它的作用是避免“thread 快过期，但 turn 还在跑”的 race。
-- thread 的活跃状态要在消息接纳时刷新，不要等最终回复完成后再刷新。
-- reaper 只能关闭“已过期且没有 in-flight turn”的 thread。
+- 它决定同一条新消息是否应该继续复用当前 thread。
+- 每次接纳新消息时刷新 `lease_until`，通常设为 `now + thread_idle_timeout_secs`。
+- turn 结束时也可以再次延长 thread lease，但不能缩短已有的更晚截止时间。
+- `lease_until` 过期后，thread 不再被视为活跃；reaper 可以将其关闭。
+- `NULL` 不应被解释为“永久可复用”；它只能表示未设置或历史脏数据，需要在实现中显式处理。
+
+### 2.6 turn lease
+
+turn lease 表示“一次 agent 运行还在进行中”。
+
+- 它用于并发保护和运行超时回收。
+- `start_turn` 时设置，`finish_turn` 时结束。
+- 它不决定 thread 是否进入新一轮对话，也不承担群聊闲置判定。
+- 若 turn 超时未结束，turn reaper 负责将其标记为失败或超时。
+
+### 2.7 reaper
+
+系统需要至少两个后台回收器：
+
+- `turn reaper`：回收超时的 `running` turn，并释放相关运行锁。
+- `thread reaper`：关闭已过期且没有正在运行 turn 的 active thread。
+
+两者职责不要混用。thread 是否关闭，不能只看 turn 是否结束；turn 是否超时，也不能靠 thread 的闲置时间推断。
 
 ## 3. Thread 生命周期
 
@@ -76,14 +96,15 @@ lease 是 turn 持有 thread 的短期租约。
 1. 根据 thread_key 查找当前活跃 thread。
 2. 如果没有活跃 thread，或已超时 / 超量，则创建新 thread。
 3. 立即刷新 `last_activity_at`。
-4. 创建或续租当前 turn 的 lease。
+4. 刷新 thread lease，延长这个会话的活跃窗口。
 5. 把消息作为 event 写入 thread。
 
 ### 3.2 运行 turn
 
 turn 运行期间：
 
-- 需要定期 heartbeat，避免长任务被误判为死掉。
+- 由单独的 turn lease 保护运行中的 agent 调用。
+- 如果模型调用或工具调用超时，turn reaper 负责收尾。
 - 如果模型需要工具，由宿主执行 tool call。
 - tool result 进入 event 流，然后继续喂回模型。
 - placeholder 消息属于 UI 行为，不应直接取代 thread 事实记录。
@@ -101,6 +122,7 @@ thread 结束条件建议包括：
 
 - 只标记为 `closed`，不要删除历史。
 - 关闭后下一个消息自然进入新 thread。
+- 只有 thread lease 过期，且没有正在运行的 turn 时，thread 才能被 reaper 关闭。
 - 如果有摘要，则新 thread 可继承最后摘要。
 
 ### 3.4 群聊规则
@@ -145,6 +167,8 @@ thread 结束条件建议包括：
 - `turn_count`
 - `version`
 
+其中 `threads.lease_until` 表示 thread 的活跃截止时间。
+
 #### turns
 
 一次完整 agent 运行的记录。
@@ -161,6 +185,7 @@ thread 结束条件建议包括：
 - `model`
 - `prompt_version`
 - `context_hash`
+- `lease_until`
 - `placeholder_message_id`
 - `final_message_id`
 - `prompt_tokens`
@@ -168,6 +193,8 @@ thread 结束条件建议包括：
 - `tool_calls`
 - `estimated_usage`
 - `error_code`
+
+其中 `turns.lease_until` 表示 turn 的运行截止时间。
 
 #### events
 
@@ -228,8 +255,9 @@ thread 内的原子事实流。
 
 - `events`、`tool_calls`、`usage_ledger` 应保持 append-only。
 - `threads`、`turns`、`summaries`、`usage_totals` 属于派生状态。
-- 后台任务至少两个：
-  - reaper：关闭过期且无 lease 的 thread。
+- 后台任务至少三个：
+  - thread reaper：关闭过期且无正在运行 turn 的 thread。
+  - turn reaper：回收超时的 running turn。
   - summarizer：压缩过长 thread 的历史。
 - 具体后端先实现 SQLite，后续如果需要切换数据库，只替换 storage backend，不改上层调用。
 
@@ -272,6 +300,7 @@ thread 内的原子事实流。
 建议后续在配置文件中加入以下参数：
 
 - `thread_idle_timeout_secs`
+- `turn_lease_secs`
 - `thread_max_turns`
 - `thread_soft_context_tokens`
 - `thread_hard_context_tokens`
@@ -284,7 +313,7 @@ thread 内的原子事实流。
 ## 7. 实现顺序建议
 
 1. 先完成 thread / turn / event 的存储骨架。
-2. 再接 thread lease 和 reaper。
+2. 再接 thread lease、turn lease 和 reaper。
 3. 再接 prompt contract 和 context builder。
 4. 再接 tool calling 闭环。
 5. 再扩展总结压缩、预算控制和更多平台。
