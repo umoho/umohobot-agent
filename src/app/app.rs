@@ -4,11 +4,18 @@ use crate::{
     logging::sanitize_for_log,
     platforms::{PlatformKind, PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
-    storage::{InboundMessageRecord, Storage, ThreadScope, UsageLedgerRecord, UsageScope},
+    storage::{
+        InboundMessageRecord, MessageObservation, Storage, StorageError, ThreadScope, TurnFinish,
+        TurnRecord, TurnStart, TurnStatus, UsageLedgerRecord, UsageScope,
+    },
     tools::ToolRegistry,
 };
+use chrono::{Duration, Utc};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+const TURN_PROMPT_VERSION: i64 = 1;
+const TURN_LEASE_MINUTES: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ReplyPlan {
@@ -18,6 +25,31 @@ pub struct ReplyPlan {
     pub placeholder_text: String,
     pub final_text: String,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedTurn {
+    pub message: PlatformMessage,
+    pub observation: MessageObservation,
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StartedTurn {
+    pub prepared: PreparedTurn,
+    pub turn: TurnRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnOutcome {
+    pub final_text: String,
+    pub notes: Vec<String>,
+    pub status: TurnStatus,
+    pub error_code: Option<String>,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u64,
+    pub estimated_usage: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,9 +94,11 @@ impl App {
         )
     }
 
-    pub async fn plan_message(&self, message: &PlatformMessage) -> ReplyPlan {
+    pub async fn prepare_turn(
+        &self,
+        message: &PlatformMessage,
+    ) -> Result<PreparedTurn, StorageError> {
         let thread_scope = ThreadScope::from_platform_message(message);
-        let thread_key = thread_scope.thread_key();
         let mut notes = structured_message_notes(message);
 
         debug!(
@@ -76,13 +110,13 @@ impl App {
             kind = %message.kind.as_str(),
             text_present = message.text().is_some(),
             attachments = message.attachments.len(),
-            "planning message reply"
+            "preparing turn"
         );
 
-        match self
+        let observation = self
             .storage
             .observe_message(InboundMessageRecord {
-                scope: thread_scope.clone(),
+                scope: thread_scope,
                 platform_message_id: message.message_id.clone(),
                 sender_id: message.sender_id.clone(),
                 sender_name: None,
@@ -97,93 +131,125 @@ impl App {
                 ),
                 lease_until: None,
             })
-            .await
-        {
-            Ok(observation) => {
-                info!(
-                    thread_id = observation.thread.id,
-                    thread_key = %observation.thread.thread_key(),
-                    thread_state = %observation.thread.state.as_str(),
-                    summary_cursor = observation.thread.summary_cursor,
-                    turn_count = observation.thread.turn_count,
-                    event_id = observation.event.id,
-                    event_seq = observation.event.seq,
-                    was_new_thread = observation.was_new_thread,
-                    "message recorded in storage"
-                );
-                if observation.was_new_thread {
-                    info!(
-                        thread_id = observation.thread.id,
-                        thread_key = %observation.thread.thread_key(),
-                        "new thread created"
-                    );
-                } else {
-                    debug!(
-                        thread_id = observation.thread.id,
-                        thread_key = %observation.thread.thread_key(),
-                        "existing thread refreshed"
-                    );
-                }
-                notes.push(format!("thread_id={}", observation.thread.id));
-                notes.push(format!("thread_key={}", observation.thread.thread_key()));
-                notes.push(format!(
-                    "thread_state={}",
-                    observation.thread.state.as_str()
-                ));
-                notes.push(format!(
-                    "thread_turn_count={}",
-                    observation.thread.turn_count
-                ));
-                notes.push(format!(
-                    "thread_summary_cursor={}",
-                    observation.thread.summary_cursor
-                ));
-                notes.push(format!("thread_new={}", observation.was_new_thread));
-                notes.push(format!("thread_event_id={}", observation.event.id));
-                notes.push(format!("thread_event_seq={}", observation.event.seq));
-            }
-            Err(err) => {
-                error!(
-                    error = %err,
-                    thread_key = %thread_key,
-                    platform = %message.platform.as_str(),
-                    room_id = %message.room_id,
-                    message_id = %message.message_id,
-                    "failed to observe inbound message"
-                );
-                notes.push(format!("storage_observe_error={err}"));
-            }
-        }
+            .await?;
 
+        debug!(
+            thread_id = observation.thread.id,
+            thread_key = %observation.thread.thread_key(),
+            thread_state = %observation.thread.state.as_str(),
+            summary_cursor = observation.thread.summary_cursor,
+            turn_count = observation.thread.turn_count,
+            event_id = observation.event.id,
+            event_seq = observation.event.seq,
+            was_new_thread = observation.was_new_thread,
+            "message recorded in storage"
+        );
+        if observation.was_new_thread {
+            info!(
+                thread_id = observation.thread.id,
+                thread_key = %observation.thread.thread_key(),
+                "new thread created"
+            );
+        } else {
+            debug!(
+                thread_id = observation.thread.id,
+                thread_key = %observation.thread.thread_key(),
+                "existing thread refreshed"
+            );
+        }
+        notes.push(format!("thread_id={}", observation.thread.id));
+        notes.push(format!("thread_key={}", observation.thread.thread_key()));
+        notes.push(format!(
+            "thread_state={}",
+            observation.thread.state.as_str()
+        ));
+        notes.push(format!(
+            "thread_turn_count={}",
+            observation.thread.turn_count
+        ));
+        notes.push(format!(
+            "thread_summary_cursor={}",
+            observation.thread.summary_cursor
+        ));
+        notes.push(format!("thread_new={}", observation.was_new_thread));
+        notes.push(format!("thread_event_id={}", observation.event.id));
+        notes.push(format!("thread_event_seq={}", observation.event.seq));
+
+        Ok(PreparedTurn {
+            message: message.clone(),
+            observation,
+            notes,
+        })
+    }
+
+    pub async fn start_turn(
+        &self,
+        prepared: &PreparedTurn,
+        placeholder_message_id: String,
+    ) -> Result<StartedTurn, StorageError> {
+        let lease_until = Some(Utc::now() + Duration::minutes(TURN_LEASE_MINUTES));
+        let turn = self
+            .storage
+            .start_turn(TurnStart {
+                thread_id: prepared.observation.thread.id,
+                trigger_event_id: prepared.observation.event.id,
+                provider: self.agent.provider_name().to_string(),
+                model: self.agent.model_name().to_string(),
+                prompt_version: TURN_PROMPT_VERSION,
+                context_hash: None,
+                placeholder_message_id: Some(placeholder_message_id),
+                lease_until,
+                started_at: None,
+            })
+            .await?;
+
+        Ok(StartedTurn {
+            prepared: prepared.clone(),
+            turn,
+        })
+    }
+
+    pub async fn respond_turn(&self, started: &StartedTurn) -> TurnOutcome {
         let AgentResponse {
             final_text: agent_text,
             notes: mut agent_notes,
+            status: agent_status,
+            error_code: agent_error_code,
         } = self
             .agent
-            .respond(&AgentRequest::new(message.clone()), &self.tools)
+            .respond(
+                &AgentRequest::new(started.prepared.message.clone()),
+                &self.tools,
+            )
             .await;
+        let mut notes = Vec::with_capacity(agent_notes.len() + 4);
         notes.append(&mut agent_notes);
+        notes.push(format!("turn_status={}", agent_status.as_str()));
+        if let Some(error_code) = agent_error_code.as_deref() {
+            notes.push(format!("turn_error_code={error_code}"));
+        }
         debug!(
             provider = %self.agent.describe(),
             response_chars = agent_text.chars().count(),
+            status = %agent_status.as_str(),
             "agent response ready"
         );
 
         let quota_decision = self.policy.decide_quota(&QuotaSnapshot::default());
         match &quota_decision {
             PolicyDecision::Allow => {
-                debug!(thread_key = %thread_key, "quota allowed");
+                debug!(thread_key = %started.prepared.observation.thread.thread_key(), "quota allowed");
             }
             PolicyDecision::Deny { reason } => {
                 warn!(
-                    thread_key = %thread_key,
+                    thread_key = %started.prepared.observation.thread.thread_key(),
                     user_error = %sanitize_for_log(reason),
                     "quota denied"
                 );
             }
             PolicyDecision::NeedConfirmation { reason } => {
                 warn!(
-                    thread_key = %thread_key,
+                    thread_key = %started.prepared.observation.thread.thread_key(),
                     user_error = %sanitize_for_log(reason),
                     "quota confirmation required"
                 );
@@ -194,12 +260,15 @@ impl App {
             quota_decision_label(&quota_decision)
         ));
 
+        let provider = self.agent.provider_name().to_string();
         if let Err(err) = self
             .storage
             .record_usage(UsageLedgerRecord {
-                scope: UsageScope::thread(thread_key.to_string()),
-                provider: self.agent.describe(),
-                turn_id: None,
+                scope: UsageScope::thread(
+                    started.prepared.observation.thread.thread_key().to_string(),
+                ),
+                provider,
+                turn_id: Some(started.turn.id),
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 tool_calls: 0,
@@ -210,15 +279,17 @@ impl App {
         {
             warn!(
                 error = %err,
-                thread_key = %thread_key,
-                provider = %self.agent.describe(),
+                thread_key = %started.prepared.observation.thread.thread_key(),
+                provider = %self.agent.provider_name(),
+                turn_id = started.turn.id,
                 "failed to record usage"
             );
             notes.push(format!("storage_usage_error={err}"));
         } else {
             debug!(
-                thread_key = %thread_key,
-                provider = %self.agent.describe(),
+                thread_key = %started.prepared.observation.thread.thread_key(),
+                provider = %self.agent.provider_name(),
+                turn_id = started.turn.id,
                 "usage recorded"
             );
         }
@@ -229,19 +300,45 @@ impl App {
         };
 
         debug!(
-            thread_key = %thread_key,
+            thread_key = %started.prepared.observation.thread.thread_key(),
+            turn_id = started.turn.id,
             final_text_chars = final_text.chars().count(),
-            "reply plan completed"
+            "turn response prepared"
         );
 
-        ReplyPlan {
-            platform: message.platform,
-            room_id: message.room_id.clone(),
-            thread_id: message.thread_id.clone(),
-            placeholder_text: self.config.placeholder_text.clone(),
+        TurnOutcome {
             final_text,
             notes,
+            status: agent_status,
+            error_code: agent_error_code,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            estimated_usage: true,
         }
+    }
+
+    pub async fn finish_turn(
+        &self,
+        started: &StartedTurn,
+        outcome: &TurnOutcome,
+        status: TurnStatus,
+        final_message_id: Option<String>,
+        error_code: Option<String>,
+    ) -> Result<TurnRecord, StorageError> {
+        self.storage
+            .finish_turn(TurnFinish {
+                turn_id: started.turn.id,
+                status,
+                final_message_id,
+                prompt_tokens: outcome.prompt_tokens,
+                completion_tokens: outcome.completion_tokens,
+                tool_calls: outcome.tool_calls,
+                estimated_usage: outcome.estimated_usage,
+                error_code,
+                ended_at: None,
+            })
+            .await
     }
 
     pub fn run(&self) {
@@ -349,6 +446,56 @@ mod tests {
         AttachmentInfo, AttachmentKind, MessageBody, PlatformKind, PlatformMessage,
         PlatformMessageKind, ReplyMetadata,
     };
+    use crate::storage::ThreadScope;
+    use std::path::PathBuf;
+
+    fn unique_data_dir(prefix: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir()
+            .join("umohobot-tests")
+            .join(format!("{prefix}-{nonce}"))
+            .join("state")
+    }
+
+    fn test_config(data_dir: PathBuf) -> Config {
+        Config {
+            bot_name: "bot".to_string(),
+            runtime_mode: RuntimeMode::Local,
+            telegram_bot_token: None,
+            default_provider: ProviderConfig {
+                kind: ProviderKind::Ollama,
+                base_url: Some("http://127.0.0.1:11434".to_string()),
+                model: "llama3.1".to_string(),
+                api_key_ref: None,
+            },
+            allow_user_provider: false,
+            max_response_chars: 4_000,
+            message_edit_throttle_ms: 750,
+            placeholder_text: "正在处理...".to_string(),
+            data_dir: Some(data_dir),
+        }
+    }
+
+    fn test_message() -> PlatformMessage {
+        PlatformMessage {
+            platform: PlatformKind::Telegram,
+            room_id: "room".to_string(),
+            thread_id: None,
+            message_id: "msg".to_string(),
+            sender_id: "user".to_string(),
+            kind: PlatformMessageKind::Text,
+            body: MessageBody::Text {
+                text: "hello".to_string(),
+                entities: vec![],
+            },
+            attachments: vec![],
+            reply: None,
+            is_mention: false,
+        }
+    }
 
     #[test]
     fn runtime_summary_reports_placeholder_edit_flow() {
@@ -420,5 +567,114 @@ mod tests {
         assert!(notes.iter().any(|note| note == "input_attachments=1"));
         assert!(notes.iter().any(|note| note == "input_reply=true"));
         assert!(notes.iter().any(|note| note == "input_mention=true"));
+    }
+
+    #[tokio::test]
+    async fn app_turn_lifecycle_records_completed_turn() {
+        let app = App::new(test_config(unique_data_dir("app-turn-completed")));
+        let message = test_message();
+
+        let prepared = app.prepare_turn(&message).await.expect("prepare turn");
+        assert_eq!(prepared.observation.thread.turn_count, 0);
+
+        let started = app
+            .start_turn(&prepared, "placeholder-1".to_string())
+            .await
+            .expect("start turn");
+        assert_eq!(
+            started.turn.placeholder_message_id.as_deref(),
+            Some("placeholder-1")
+        );
+        assert_eq!(started.turn.status, TurnStatus::Running);
+
+        let active = app
+            .storage
+            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .await
+            .expect("load active thread")
+            .expect("active thread");
+        assert_eq!(active.turn_count, 1);
+        assert!(active.lease_until.is_some());
+
+        let outcome = TurnOutcome {
+            final_text: "done".to_string(),
+            notes: vec![],
+            status: TurnStatus::Completed,
+            error_code: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            estimated_usage: true,
+        };
+
+        let finished = app
+            .finish_turn(
+                &started,
+                &outcome,
+                TurnStatus::Completed,
+                Some("placeholder-1".to_string()),
+                None,
+            )
+            .await
+            .expect("finish turn");
+
+        assert_eq!(finished.status, TurnStatus::Completed);
+        assert_eq!(finished.final_message_id.as_deref(), Some("placeholder-1"));
+
+        let active_after = app
+            .storage
+            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .await
+            .expect("load active thread after finish")
+            .expect("active thread after finish");
+        assert_eq!(active_after.turn_count, 1);
+        assert!(active_after.lease_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn app_turn_lifecycle_records_failed_turn() {
+        let app = App::new(test_config(unique_data_dir("app-turn-failed")));
+        let message = test_message();
+
+        let prepared = app.prepare_turn(&message).await.expect("prepare turn");
+        let started = app
+            .start_turn(&prepared, "placeholder-1".to_string())
+            .await
+            .expect("start turn");
+
+        let outcome = TurnOutcome {
+            final_text: "rig 请求失败：boom".to_string(),
+            notes: vec![],
+            status: TurnStatus::Failed,
+            error_code: Some("provider_error".to_string()),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+            estimated_usage: true,
+        };
+
+        let finished = app
+            .finish_turn(
+                &started,
+                &outcome,
+                TurnStatus::Failed,
+                None,
+                Some("provider_error".to_string()),
+            )
+            .await
+            .expect("finish turn");
+
+        assert_eq!(finished.status, TurnStatus::Failed);
+        assert!(finished.final_message_id.is_none());
+        assert_eq!(finished.error_code.as_deref(), Some("provider_error"));
+
+        let active_after = app
+            .storage
+            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .await
+            .expect("load active thread after finish")
+            .expect("active thread after finish");
+        assert!(active_after.lease_until.is_none());
+        assert_eq!(active_after.turn_count, 1);
     }
 }

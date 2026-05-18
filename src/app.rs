@@ -1,3 +1,3 @@
 pub mod app;
 
-pub use app::{App, ReplyPlan, run};
+pub use app::{App, PreparedTurn, ReplyPlan, StartedTurn, TurnOutcome, run};

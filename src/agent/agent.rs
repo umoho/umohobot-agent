@@ -4,6 +4,7 @@ use crate::{
     config::{Config, ProviderKind},
     logging::sanitize_for_log,
     platforms::PlatformMessage,
+    storage::TurnStatus,
     tools::ToolRegistry,
 };
 use rig::{
@@ -37,6 +38,8 @@ impl AgentRequest {
 pub struct AgentResponse {
     pub final_text: String,
     pub notes: Vec<String>,
+    pub status: TurnStatus,
+    pub error_code: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,6 +141,14 @@ impl AgentRuntime {
         )
     }
 
+    pub fn provider_name(&self) -> &'static str {
+        self.provider_backend.as_str()
+    }
+
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
+
     pub async fn respond(&self, request: &AgentRequest, tools: &ToolRegistry) -> AgentResponse {
         let prompt_text = request.prompt_text();
         if prompt_text.trim().is_empty() {
@@ -149,6 +160,8 @@ impl AgentRuntime {
             return AgentResponse {
                 final_text: "当前没有收到有效输入，骨架层暂不生成模型回复。".to_string(),
                 notes: self.notes(tools, request, Some("empty_input")),
+                status: TurnStatus::Completed,
+                error_code: None,
             };
         }
 
@@ -183,6 +196,8 @@ impl AgentRuntime {
                 AgentResponse {
                     final_text: self.truncate_response(cleaned),
                     notes: self.notes(tools, request, Some("rig_prompt")),
+                    status: TurnStatus::Completed,
+                    error_code: None,
                 }
             }
             Err(err) => AgentResponse {
@@ -198,6 +213,8 @@ impl AgentRuntime {
                     user_message
                 },
                 notes: self.notes(tools, request, Some("provider_error")),
+                status: TurnStatus::Failed,
+                error_code: Some("provider_error".to_string()),
             },
         }
     }
