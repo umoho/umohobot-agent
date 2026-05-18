@@ -1,6 +1,7 @@
 use std::{error::Error, io};
 
 use crate::{
+    agent::AgentRuntimeError,
     app::{App, ReplyPlan},
     config::{Config, RuntimeMode},
     platforms::{PlatformMessage, Platforms, TelegramReplyScript, TelegramRuntime},
@@ -28,16 +29,20 @@ pub struct RuntimeController {
 
 impl RuntimeController {
     pub fn new(config: Config) -> Self {
-        let app = App::new(config.clone());
+        Self::try_new(config).unwrap_or_else(|err| panic!("failed to initialize runtime: {err}"))
+    }
+
+    pub fn try_new(config: Config) -> Result<Self, AgentRuntimeError> {
+        let app = App::try_new(config.clone())?;
         let platforms = Platforms::new();
         let telegram = TelegramRuntime::from_config(&config);
 
-        Self {
+        Ok(Self {
             config,
             app,
             platforms,
             telegram,
-        }
+        })
     }
 
     pub fn summary(&self) -> RuntimeSummary {

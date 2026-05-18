@@ -11,8 +11,13 @@ placeholder_text = "正在处理..."
 kind = "ollama"
 base_url = "http://127.0.0.1:11434"
 model = "deepseek-r1:8b"
-# 如果 provider 需要 API Key，可以再取消注释并填写环境变量名
+# 如果 provider 需要 API Key，请填写环境变量名，值会从环境变量读取
 # api_key_ref = "OPENAI_API_KEY"
+# OpenRouter 示例：
+# kind = "openai_compatible"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "openai/gpt-4o-mini"
+# api_key_ref = "OPENROUTER_API_KEY"
 
 [storage]
 data_dir = "./data"

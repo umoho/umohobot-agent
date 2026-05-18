@@ -1,5 +1,5 @@
 use crate::{
-    agent::{AgentRequest, AgentResponse, AgentRuntime},
+    agent::{AgentRequest, AgentResponse, AgentRuntime, AgentRuntimeError},
     config::Config,
     platforms::{PlatformKind, PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
@@ -30,20 +30,24 @@ pub struct App {
 
 impl App {
     pub fn new(config: Config) -> Self {
+        Self::try_new(config).unwrap_or_else(|err| panic!("failed to initialize app: {err}"))
+    }
+
+    pub fn try_new(config: Config) -> Result<Self, AgentRuntimeError> {
         let storage = Storage::new(config.data_dir.clone());
         let policy = PolicyEngine::new();
         let tools = ToolRegistry::new();
-        let agent = AgentRuntime::new(&config);
+        let agent = AgentRuntime::try_new(&config)?;
         let platforms = Platforms::new();
 
-        Self {
+        Ok(Self {
             config,
             storage,
             policy,
             tools,
             agent,
             platforms,
-        }
+        })
     }
 
     pub fn describe(&self) -> String {

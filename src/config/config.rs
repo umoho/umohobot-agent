@@ -138,8 +138,9 @@ impl Config {
         let provider_base_url = env_string("DEFAULT_BASE_URL")
             .or(file.provider.base_url)
             .or_else(|| {
-                matches!(provider_kind, Some(ProviderKind::Ollama))
-                    .then(|| "http://127.0.0.1:11434".to_string())
+                provider_kind
+                    .and_then(ProviderKind::default_base_url)
+                    .map(str::to_string)
             });
         let api_key_ref = env_string("DEFAULT_API_KEY_REF")
             .or_else(|| env_string("DEFAULT_API_KEY_ENV"))
@@ -159,6 +160,28 @@ impl Config {
             .is_empty()
         {
             missing.push("provider.model");
+        }
+        if provider_kind
+            .map(ProviderKind::requires_api_key_ref)
+            .unwrap_or(false)
+            && api_key_ref
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            missing.push("provider.api_key_ref");
+        }
+        if provider_kind
+            .map(ProviderKind::requires_explicit_base_url)
+            .unwrap_or(false)
+            && provider_base_url
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            missing.push("provider.base_url");
         }
         if matches!(runtime_mode, RuntimeMode::Telegram) && telegram_bot_token.is_none() {
             missing.push("telegram.bot_token");
@@ -224,6 +247,31 @@ impl Config {
 }
 
 impl ProviderKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::OpenAICompatible => "openai_compatible",
+            Self::OpenAI => "openai",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub(crate) fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Ollama => Some("http://127.0.0.1:11434"),
+            Self::OpenAI => Some("https://api.openai.com/v1"),
+            Self::OpenAICompatible | Self::Custom => None,
+        }
+    }
+
+    pub(crate) fn requires_api_key_ref(self) -> bool {
+        !matches!(self, Self::Ollama)
+    }
+
+    pub(crate) fn requires_explicit_base_url(self) -> bool {
+        matches!(self, Self::OpenAICompatible | Self::Custom)
+    }
+
     fn from_env(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "ollama" => Some(Self::Ollama),
@@ -279,4 +327,36 @@ fn env_provider_kind() -> Option<ProviderKind> {
 
 fn env_legacy_provider_kind() -> Option<ProviderKind> {
     env_string("DEFAULT_PROVIDER").and_then(|value| ProviderKind::from_env(&value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_kind_default_base_urls_match_expected_backends() {
+        assert_eq!(
+            ProviderKind::Ollama.default_base_url(),
+            Some("http://127.0.0.1:11434")
+        );
+        assert_eq!(
+            ProviderKind::OpenAI.default_base_url(),
+            Some("https://api.openai.com/v1")
+        );
+        assert_eq!(ProviderKind::OpenAICompatible.default_base_url(), None);
+        assert_eq!(ProviderKind::Custom.default_base_url(), None);
+    }
+
+    #[test]
+    fn provider_kind_requirement_flags_match_expected_backends() {
+        assert!(!ProviderKind::Ollama.requires_api_key_ref());
+        assert!(ProviderKind::OpenAI.requires_api_key_ref());
+        assert!(ProviderKind::OpenAICompatible.requires_api_key_ref());
+        assert!(ProviderKind::Custom.requires_api_key_ref());
+
+        assert!(!ProviderKind::Ollama.requires_explicit_base_url());
+        assert!(!ProviderKind::OpenAI.requires_explicit_base_url());
+        assert!(ProviderKind::OpenAICompatible.requires_explicit_base_url());
+        assert!(ProviderKind::Custom.requires_explicit_base_url());
+    }
 }
