@@ -1,9 +1,9 @@
 use std::env;
 
 use crate::{
+    agent::context::PromptContext,
     config::{Config, ProviderKind},
     logging::sanitize_for_log,
-    platforms::PlatformMessage,
     storage::TurnStatus,
     tools::ToolRegistry,
 };
@@ -16,21 +16,20 @@ use rig::{
 use thiserror::Error;
 use tracing::{debug, error, info};
 
-const DEFAULT_PROMPT_PREAMBLE: &str = "你是一个 Telegram AI Bot。输入可能包含正文、附件、回复和@提及等结构化上下文。请结合这些信息使用简洁中文回答，不要输出推理过程。";
 const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 #[derive(Clone, Debug)]
 pub struct AgentRequest {
-    pub message: PlatformMessage,
+    pub prompt: PromptContext,
 }
 
 impl AgentRequest {
-    pub fn new(message: PlatformMessage) -> Self {
-        Self { message }
+    pub fn new(prompt: PromptContext) -> Self {
+        Self { prompt }
     }
 
-    pub fn prompt_text(&self) -> String {
-        self.message.prompt_text()
+    pub fn prompt_text(&self) -> &str {
+        self.prompt.prompt_text()
     }
 }
 
@@ -227,10 +226,7 @@ impl AgentRuntime {
     where
         C: CompletionClient,
     {
-        let agent = client
-            .agent(self.model.as_str())
-            .preamble(DEFAULT_PROMPT_PREAMBLE)
-            .build();
+        let agent = client.agent(self.model.as_str()).build();
 
         agent.prompt(input).await.map_err(|err| err.to_string())
     }
@@ -248,13 +244,41 @@ impl AgentRuntime {
             format!("base_url={}", self.base_url),
             format!("user_provider_enabled={}", self.user_provider_enabled),
             format!("registered_tools={}", tools.count()),
-            format!("input_kind={}", request.message.kind.as_str()),
-            format!("input_body_kind={}", request.message.body.kind_label()),
-            format!("input_entities={}", request.message.body_entities().len()),
-            format!("input_attachments={}", request.message.attachments.len()),
-            format!("input_reply={}", request.message.reply.is_some()),
-            format!("input_mention={}", request.message.is_mention),
-            format!("input_text_present={}", request.message.text().is_some()),
+            format!("prompt_version={}", request.prompt.prompt_version),
+            format!(
+                "prompt_estimated_tokens={}",
+                request.prompt.estimated_tokens
+            ),
+            format!("prompt_sections={}", request.prompt.sections.len()),
+            format!("prompt_recent_events={}", request.prompt.recent_event_count),
+            format!(
+                "prompt_recent_events_trimmed={}",
+                request.prompt.trimmed_recent_event_count
+            ),
+            format!("prompt_summary_present={}", request.prompt.summary_present),
+            format!("thread_id={}", request.prompt.thread_id),
+            format!("thread_key={}", request.prompt.thread_key),
+            format!("thread_state={}", request.prompt.thread_state),
+            format!("input_kind={}", request.prompt.current_turn.kind.as_str()),
+            format!("input_body_kind={}", request.prompt.current_turn.body_kind),
+            format!(
+                "input_entities={}",
+                request.prompt.current_turn.entity_count
+            ),
+            format!(
+                "input_attachments={}",
+                request.prompt.current_turn.attachment_count
+            ),
+            format!("input_reply={}", request.prompt.current_turn.reply_present),
+            format!("input_mention={}", request.prompt.current_turn.mention),
+            format!(
+                "input_text_present={}",
+                request.prompt.current_turn.text_present
+            ),
+            format!(
+                "input_speaker={}",
+                request.prompt.current_turn.sender.label()
+            ),
         ];
         if let Some(done_reason) = done_reason {
             notes.push(format!("done_reason={done_reason}"));
@@ -378,11 +402,11 @@ fn strip_think_sections(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProviderConfig, ProviderKind, RuntimeMode};
-    use crate::platforms::{
-        AttachmentInfo, AttachmentKind, MessageBody, PlatformKind, PlatformMessage,
-        PlatformMessageKind, ReplyMetadata,
+    use crate::agent::context::{
+        PromptContext, PromptCurrentTurn, PromptSection, PromptSectionKind, PromptSpeaker,
     };
+    use crate::config::{PromptConfig, ProviderConfig, ProviderKind, RuntimeMode};
+    use crate::platforms::{PlatformKind, PlatformMessageKind};
 
     #[test]
     fn normalize_ollama_base_url_strips_api_suffix() {
@@ -453,6 +477,7 @@ mod tests {
             max_response_chars: 4_000,
             message_edit_throttle_ms: 750,
             placeholder_text: "正在处理...".to_string(),
+            prompt: PromptConfig::default(),
             data_dir: None,
         };
 
@@ -467,70 +492,10 @@ mod tests {
     }
 
     #[test]
-    fn agent_request_prompt_text_preserves_plain_text_messages() {
-        let request = AgentRequest::new(PlatformMessage {
-            platform: PlatformKind::Telegram,
-            room_id: "room".to_string(),
-            thread_id: None,
-            message_id: "msg".to_string(),
-            sender_id: "user".to_string(),
-            kind: PlatformMessageKind::Text,
-            body: MessageBody::Text {
-                text: "你好".to_string(),
-                entities: vec![],
-            },
-            attachments: vec![],
-            reply: None,
-            is_mention: false,
-        });
+    fn agent_request_prompt_text_uses_rendered_prompt_context() {
+        let request = AgentRequest::new(prompt_context("rendered prompt"));
 
-        assert_eq!(request.prompt_text(), "你好");
-    }
-
-    #[test]
-    fn agent_request_prompt_text_includes_structured_context() {
-        let request = AgentRequest::new(PlatformMessage {
-            platform: PlatformKind::Telegram,
-            room_id: "room".to_string(),
-            thread_id: None,
-            message_id: "msg".to_string(),
-            sender_id: "user".to_string(),
-            kind: PlatformMessageKind::Photo,
-            body: MessageBody::Caption {
-                text: "看这张图".to_string(),
-                entities: vec![],
-            },
-            attachments: vec![AttachmentInfo {
-                kind: AttachmentKind::Image,
-                file_id: Some("file-id".to_string()),
-                file_unique_id: Some("file-unique-id".to_string()),
-                file_name: None,
-                mime_type: None,
-                url: None,
-                width: Some(640),
-                height: Some(480),
-                size_bytes: Some(1_024),
-            }],
-            reply: Some(ReplyMetadata {
-                message_id: "reply-1".to_string(),
-                sender_id: "user-2".to_string(),
-                kind: PlatformMessageKind::Text,
-                body: MessageBody::Text {
-                    text: "原始消息".to_string(),
-                    entities: vec![],
-                },
-                attachments: vec![],
-            }),
-            is_mention: true,
-        });
-
-        let prompt = request.prompt_text();
-
-        assert!(prompt.contains("看这张图"));
-        assert!(prompt.contains("message_kind=photo"));
-        assert!(prompt.contains("attachments=image"));
-        assert!(prompt.contains("reply=message_id=reply-1"));
-        assert!(prompt.contains("bot_mentioned=true"));
+        assert_eq!(request.prompt_text(), "rendered prompt");
     }
 
     #[test]
@@ -539,5 +504,54 @@ mod tests {
             strip_think_sections("<think>reasoning</think>\n\n最终答案"),
             "最终答案"
         );
+    }
+
+    fn prompt_context(rendered_prompt_text: &str) -> PromptContext {
+        PromptContext {
+            prompt_version: 1,
+            thread_id: 1,
+            thread_key: "telegram:room".to_string(),
+            thread_state: "active".to_string(),
+            summary_present: false,
+            current_turn: PromptCurrentTurn {
+                event_id: 1,
+                message_id: "msg".to_string(),
+                seq: 1,
+                sender: PromptSpeaker::new("user", Some("Alice".to_string())),
+                platform: PlatformKind::Telegram.as_str().to_string(),
+                room_id: "room".to_string(),
+                thread_id: None,
+                kind: PlatformMessageKind::Text.as_str().to_string(),
+                body_kind: "text".to_string(),
+                text_present: true,
+                text_chars: 5,
+                entity_count: 0,
+                attachment_count: 0,
+                reply_present: false,
+                reply_message_id: None,
+                reply_sender_id: None,
+                mention: false,
+                body_text: "hello".to_string(),
+                rendered_text: "hello".to_string(),
+                estimated_tokens: 1,
+                trimmed: false,
+            },
+            recent_events: vec![],
+            tools: vec![],
+            sections: vec![PromptSection::new(
+                PromptSectionKind::SystemRules,
+                "system rules",
+                false,
+            )],
+            rendered_prompt: rendered_prompt_text.to_string(),
+            estimated_tokens: rendered_prompt_text.chars().count(),
+            recent_event_count: 0,
+            trimmed_recent_event_count: 0,
+            trimmed_summary_chars: 0,
+            trimmed_current_turn_chars: 0,
+            trimmed_tool_catalog_chars: 0,
+            trimmed_response_policy_chars: 0,
+            trimmed_system_rules_chars: 0,
+        }
     }
 }

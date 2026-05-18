@@ -261,35 +261,18 @@ impl SqliteStorage {
         .await?;
 
         let turn_id = result.last_insert_rowid();
-        let thread_update = if let Some(lease_until_ms) = lease_until_ms {
-            sqlx::query(
-                r#"
-                UPDATE threads
-                SET turn_count = turn_count + 1,
-                    lease_until = ?,
-                    version = version + 1
-                WHERE id = ? AND state = ?
-                "#,
-            )
-            .bind(lease_until_ms)
-            .bind(turn.thread_id)
-            .bind(ThreadState::Active.as_str())
-            .execute(tx.as_mut())
-            .await?
-        } else {
-            sqlx::query(
-                r#"
-                UPDATE threads
-                SET turn_count = turn_count + 1,
-                    version = version + 1
-                WHERE id = ? AND state = ?
-                "#,
-            )
-            .bind(turn.thread_id)
-            .bind(ThreadState::Active.as_str())
-            .execute(tx.as_mut())
-            .await?
-        };
+        let thread_update = sqlx::query(
+            r#"
+            UPDATE threads
+            SET turn_count = turn_count + 1,
+                version = version + 1
+            WHERE id = ? AND state = ?
+            "#,
+        )
+        .bind(turn.thread_id)
+        .bind(ThreadState::Active.as_str())
+        .execute(tx.as_mut())
+        .await?;
 
         if thread_update.rows_affected() == 0 {
             warn!(
@@ -325,7 +308,7 @@ impl SqliteStorage {
 
         let pool = self.pool().await?;
         let mut tx = pool.begin().await?;
-        let original = self.load_turn_row_tx(&mut tx, turn.turn_id).await?;
+        let _ = self.load_turn_row_tx(&mut tx, turn.turn_id).await?;
         let ended_at = turn.ended_at.unwrap_or_else(Utc::now);
         let ended_at_ms = datetime_to_millis(ended_at);
         let prompt_tokens = u64_to_i64(turn.prompt_tokens)?;
@@ -341,7 +324,8 @@ impl SqliteStorage {
                 completion_tokens = ?,
                 tool_calls = ?,
                 estimated_usage = ?,
-                error_code = ?
+                error_code = ?,
+                lease_until = NULL
             WHERE id = ?
             "#,
         )
@@ -365,30 +349,6 @@ impl SqliteStorage {
             return Err(StorageError::InvalidValue {
                 kind: "turn_id",
                 value: turn.turn_id.to_string(),
-            });
-        }
-
-        let lease_clear = sqlx::query(
-            r#"
-            UPDATE threads
-            SET lease_until = NULL,
-                version = version + 1
-            WHERE id = ?
-            "#,
-        )
-        .bind(original.thread_id)
-        .execute(tx.as_mut())
-        .await?;
-
-        if lease_clear.rows_affected() == 0 {
-            warn!(
-                thread_id = original.thread_id,
-                turn_id = turn.turn_id,
-                "failed to clear thread lease after finishing turn"
-            );
-            return Err(StorageError::InvalidValue {
-                kind: "thread_id",
-                value: original.thread_id.to_string(),
             });
         }
 
@@ -624,6 +584,140 @@ impl SqliteStorage {
             thread_key = %scope.thread_key(),
             found = row.is_some(),
             "loaded latest thread"
+        );
+        row.map(ThreadRow::into_record).transpose()
+    }
+
+    pub async fn load_latest_summary(
+        &self,
+        thread_id: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        self.load_latest_summary_before_seq(thread_id, i64::MAX)
+            .await
+    }
+
+    pub async fn load_latest_summary_before_seq(
+        &self,
+        thread_id: i64,
+        upto_seq: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        self.ensure_ready().await?;
+
+        let pool = self.pool().await?;
+        let row = sqlx::query_as::<_, SummaryRow>(
+            r#"
+            SELECT
+                id,
+                thread_id,
+                upto_seq,
+                summary_text,
+                created_at,
+                model,
+                prompt_version
+            FROM summaries
+            WHERE thread_id = ?
+              AND upto_seq <= ?
+            ORDER BY upto_seq DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(thread_id)
+        .bind(upto_seq)
+        .fetch_optional(pool)
+        .await?;
+        debug!(
+            thread_id = thread_id,
+            upto_seq = upto_seq,
+            found = row.is_some(),
+            "loaded latest summary"
+        );
+        row.map(SummaryRow::into_record).transpose()
+    }
+
+    pub async fn load_recent_visible_events(
+        &self,
+        thread_id: i64,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        self.ensure_ready().await?;
+
+        let pool = self.pool().await?;
+        let mut rows = sqlx::query_as::<_, EventRow>(
+            r#"
+            SELECT
+                id,
+                thread_id,
+                seq,
+                turn_id,
+                kind,
+                sender_id,
+                sender_name,
+                platform_message_id,
+                reply_to_platform_message_id,
+                content_json,
+                visible_to_model,
+                created_at
+            FROM events
+            WHERE thread_id = ?
+              AND visible_to_model = 1
+              AND seq > ?
+              AND seq < ?
+            ORDER BY seq DESC, id DESC
+            "#,
+        )
+        .bind(thread_id)
+        .bind(after_seq_exclusive)
+        .bind(before_seq_exclusive)
+        .fetch_all(pool)
+        .await?;
+        rows.reverse();
+        let event_count = rows.len();
+        let events = rows
+            .into_iter()
+            .map(EventRow::into_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        debug!(
+            thread_id = thread_id,
+            after_seq_exclusive = after_seq_exclusive,
+            before_seq_exclusive = before_seq_exclusive,
+            event_count = event_count,
+            "loaded recent visible events"
+        );
+        Ok(events)
+    }
+
+    pub async fn load_thread(&self, thread_id: i64) -> Result<Option<ThreadRecord>, StorageError> {
+        self.ensure_ready().await?;
+
+        let pool = self.pool().await?;
+        let row = sqlx::query_as::<_, ThreadRow>(
+            r#"
+            SELECT
+                id,
+                platform,
+                chat_id,
+                topic_id,
+                state,
+                opened_at,
+                last_activity_at,
+                lease_until,
+                closed_at,
+                parent_thread_id,
+                summary_cursor,
+                turn_count,
+                version
+            FROM threads
+            WHERE id = ?
+            "#,
+        )
+        .bind(thread_id)
+        .fetch_optional(pool)
+        .await?;
+        debug!(
+            thread_id = thread_id,
+            found = row.is_some(),
+            "loaded thread by id"
         );
         row.map(ThreadRow::into_record).transpose()
     }
@@ -1243,9 +1337,7 @@ struct ThreadRow {
 
 impl ThreadRow {
     fn is_usable_at(&self, now_ms: i64) -> bool {
-        self.lease_until
-            .map(|lease_until| lease_until > now_ms)
-            .unwrap_or(true)
+        matches!(self.lease_until, Some(lease_until) if lease_until > now_ms)
     }
 
     fn into_record(self) -> Result<ThreadRecord, StorageError> {
@@ -1486,12 +1578,25 @@ mod tests {
             .join("state.sqlite3")
     }
 
+    fn datetime_from_millis(millis: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp_millis(millis).expect("valid timestamp")
+    }
+
+    fn lease_after_secs(secs: i64) -> DateTime<Utc> {
+        datetime_from_millis(Utc::now().timestamp_millis() + secs * 1_000)
+    }
+
+    fn lease_before_secs(secs: i64) -> DateTime<Utc> {
+        datetime_from_millis(Utc::now().timestamp_millis() - secs * 1_000)
+    }
+
     fn inbound_message(
         scope: ThreadScope,
         platform_message_id: String,
         sender_id: String,
         sender_name: Option<String>,
         text: String,
+        lease_until: Option<DateTime<Utc>>,
     ) -> InboundMessageRecord {
         InboundMessageRecord {
             scope,
@@ -1503,7 +1608,7 @@ mod tests {
                 "text": text,
             }),
             visible_to_model: true,
-            lease_until: None,
+            lease_until,
         }
     }
 
@@ -1511,6 +1616,7 @@ mod tests {
     async fn sqlite_storage_tracks_threads_turns_summaries_and_usage() {
         let storage = SqliteStorage::new(unique_database_path("storage-smoke"));
         let scope = ThreadScope::new(PlatformKind::Telegram, "chat-1", Some("42".to_string()));
+        let thread_lease_until = lease_after_secs(300);
 
         let observation = storage
             .observe_message(inbound_message(
@@ -1519,6 +1625,7 @@ mod tests {
                 "user-1".to_string(),
                 Some("Alice".to_string()),
                 "hello".to_string(),
+                Some(thread_lease_until),
             ))
             .await
             .expect("observe message");
@@ -1529,6 +1636,7 @@ mod tests {
             observation.thread.thread_key().as_str(),
             "telegram:chat-1:topic:42"
         );
+        let turn_lease_until = lease_after_secs(60);
 
         let turn = storage
             .start_turn(TurnStart {
@@ -1539,7 +1647,7 @@ mod tests {
                 prompt_version: 1,
                 context_hash: Some("ctx".to_string()),
                 placeholder_message_id: Some("placeholder-1".to_string()),
-                lease_until: None,
+                lease_until: Some(turn_lease_until),
                 started_at: None,
             })
             .await
@@ -1548,6 +1656,61 @@ mod tests {
         assert_eq!(turn.thread_id, observation.thread.id);
         assert_eq!(turn.trigger_event_id, observation.event.id);
         assert_eq!(turn.status, TurnStatus::Running);
+        assert_eq!(turn.lease_until, Some(turn_lease_until));
+
+        let assistant_event = storage
+            .append_event(NewEvent {
+                thread_id: observation.thread.id,
+                turn_id: Some(turn.id),
+                kind: EventKind::AssistantMessage,
+                sender_id: Some("assistant".to_string()),
+                sender_name: Some("Bot".to_string()),
+                platform_message_id: Some("msg-2".to_string()),
+                reply_to_platform_message_id: Some("msg-1".to_string()),
+                content: serde_json::json!({
+                    "text": "working",
+                }),
+                visible_to_model: true,
+                created_at: None,
+            })
+            .await
+            .expect("append assistant event");
+
+        let hidden_event = storage
+            .append_event(NewEvent {
+                thread_id: observation.thread.id,
+                turn_id: Some(turn.id),
+                kind: EventKind::SystemNote,
+                sender_id: None,
+                sender_name: None,
+                platform_message_id: Some("msg-3".to_string()),
+                reply_to_platform_message_id: None,
+                content: serde_json::json!({
+                    "note": "hidden",
+                }),
+                visible_to_model: false,
+                created_at: None,
+            })
+            .await
+            .expect("append hidden event");
+
+        let final_event = storage
+            .append_event(NewEvent {
+                thread_id: observation.thread.id,
+                turn_id: Some(turn.id),
+                kind: EventKind::AssistantMessage,
+                sender_id: Some("assistant".to_string()),
+                sender_name: Some("Bot".to_string()),
+                platform_message_id: Some("msg-4".to_string()),
+                reply_to_platform_message_id: Some("msg-1".to_string()),
+                content: serde_json::json!({
+                    "text": "done",
+                }),
+                visible_to_model: true,
+                created_at: None,
+            })
+            .await
+            .expect("append final event");
 
         let finished = storage
             .finish_turn(TurnFinish {
@@ -1570,7 +1733,7 @@ mod tests {
         assert_eq!(finished.tool_calls, 2);
         assert!(finished.lease_until.is_none());
 
-        let summary = storage
+        let initial_summary = storage
             .append_summary(SummaryWrite {
                 thread_id: observation.thread.id,
                 upto_seq: observation.event.seq,
@@ -1580,10 +1743,25 @@ mod tests {
                 created_at: None,
             })
             .await
-            .expect("append summary");
+            .expect("append initial summary");
 
-        assert_eq!(summary.thread_id, observation.thread.id);
-        assert_eq!(summary.upto_seq, 1);
+        assert_eq!(initial_summary.thread_id, observation.thread.id);
+        assert_eq!(initial_summary.upto_seq, 1);
+
+        let latest_summary = storage
+            .append_summary(SummaryWrite {
+                thread_id: observation.thread.id,
+                upto_seq: final_event.seq,
+                summary_text: "latest summary".to_string(),
+                model: "llama3.1".to_string(),
+                prompt_version: 1,
+                created_at: None,
+            })
+            .await
+            .expect("append latest summary");
+
+        assert_eq!(latest_summary.thread_id, observation.thread.id);
+        assert_eq!(latest_summary.upto_seq, 4);
 
         let totals = storage
             .record_usage(UsageLedgerRecord {
@@ -1606,15 +1784,257 @@ mod tests {
         assert_eq!(totals.estimated_completion_tokens, 34);
         assert_eq!(totals.estimated_tool_calls, 2);
 
+        let previous_summary = storage
+            .load_latest_summary_before_seq(observation.thread.id, 3)
+            .await
+            .expect("load previous summary")
+            .expect("previous summary should exist");
+        assert_eq!(previous_summary.upto_seq, 1);
+
+        let loaded_summary = storage
+            .load_latest_summary_before_seq(observation.thread.id, 4)
+            .await
+            .expect("load latest summary")
+            .expect("summary should exist");
+        assert_eq!(loaded_summary.upto_seq, 4);
+        assert_eq!(loaded_summary.summary_text, "latest summary");
+
+        let recent_events = storage
+            .load_recent_visible_events(observation.thread.id, 1, 5)
+            .await
+            .expect("load recent visible events");
+        assert_eq!(
+            recent_events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        assert!(recent_events.iter().all(|event| event.visible_to_model));
+        assert_eq!(recent_events[0].id, assistant_event.id);
+        assert_eq!(recent_events[1].id, final_event.id);
+        assert_ne!(hidden_event.id, recent_events[0].id);
+
         let active = storage
             .load_active_thread(&scope)
             .await
             .expect("load active thread")
             .expect("thread should stay active");
         assert_eq!(active.id, observation.thread.id);
-        assert_eq!(active.summary_cursor, 1);
+        assert_eq!(active.summary_cursor, 4);
         assert_eq!(active.turn_count, 1);
-        assert!(active.lease_until.is_none());
+        assert_eq!(active.lease_until, Some(thread_lease_until));
+    }
+
+    #[tokio::test]
+    async fn active_thread_is_reused_before_lease_expires() {
+        let storage = SqliteStorage::new(unique_database_path("active-reuse"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-1-reuse", None);
+        let first_lease_until = lease_after_secs(300);
+        let second_lease_until = lease_after_secs(600);
+
+        let first = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+                Some(first_lease_until),
+            ))
+            .await
+            .expect("observe first message");
+
+        assert!(first.was_new_thread);
+        assert_eq!(first.thread.lease_until, Some(first_lease_until));
+
+        let active_before = storage
+            .load_active_thread(&scope)
+            .await
+            .expect("load active thread before reuse")
+            .expect("active thread should exist");
+        assert_eq!(active_before.id, first.thread.id);
+        assert_eq!(active_before.lease_until, Some(first_lease_until));
+
+        let second = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-2".to_string(),
+                "user-2".to_string(),
+                Some("Bob".to_string()),
+                "follow up".to_string(),
+                Some(second_lease_until),
+            ))
+            .await
+            .expect("observe second message");
+
+        assert!(!second.was_new_thread);
+        assert_eq!(second.thread.id, first.thread.id);
+        assert_eq!(second.thread.lease_until, Some(second_lease_until));
+
+        let active_after = storage
+            .load_active_thread(&scope)
+            .await
+            .expect("load active thread after reuse")
+            .expect("active thread should remain");
+        assert_eq!(active_after.id, first.thread.id);
+        assert_eq!(active_after.lease_until, Some(second_lease_until));
+    }
+
+    #[tokio::test]
+    async fn null_thread_lease_is_not_reusable() {
+        let storage = SqliteStorage::new(unique_database_path("null-lease"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-null", None);
+
+        let first = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+                None,
+            ))
+            .await
+            .expect("observe first message");
+
+        assert!(first.was_new_thread);
+        assert!(first.thread.lease_until.is_none());
+        assert!(
+            storage
+                .load_active_thread(&scope)
+                .await
+                .expect("load active thread")
+                .is_none()
+        );
+
+        let second = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-2".to_string(),
+                "user-2".to_string(),
+                Some("Bob".to_string()),
+                "hello again".to_string(),
+                None,
+            ))
+            .await
+            .expect("observe second message");
+
+        assert!(second.was_new_thread);
+        assert_ne!(first.thread.id, second.thread.id);
+
+        let pool = storage.pool().await.expect("pool");
+        let old_state: String = sqlx::query_scalar(
+            r#"
+            SELECT state
+            FROM threads
+            WHERE id = ?
+            "#,
+        )
+        .bind(first.thread.id)
+        .fetch_one(pool)
+        .await
+        .expect("load old thread state");
+        assert_eq!(old_state, "draining");
+    }
+
+    #[tokio::test]
+    async fn turn_lease_lifecycle_updates_turns_only() {
+        let storage = SqliteStorage::new(unique_database_path("turn-lease"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-turn", None);
+        let thread_lease_until = lease_after_secs(300);
+        let turn_lease_until = lease_after_secs(60);
+
+        let observation = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+                Some(thread_lease_until),
+            ))
+            .await
+            .expect("observe message");
+
+        let turn = storage
+            .start_turn(TurnStart {
+                thread_id: observation.thread.id,
+                trigger_event_id: observation.event.id,
+                provider: "ollama".to_string(),
+                model: "llama3.1".to_string(),
+                prompt_version: 1,
+                context_hash: None,
+                placeholder_message_id: Some("placeholder-1".to_string()),
+                lease_until: Some(turn_lease_until),
+                started_at: None,
+            })
+            .await
+            .expect("start turn");
+
+        assert_eq!(turn.lease_until, Some(turn_lease_until));
+
+        let thread_before_finish = storage
+            .load_thread(observation.thread.id)
+            .await
+            .expect("load thread before finish")
+            .expect("thread should exist");
+        assert_eq!(thread_before_finish.lease_until, Some(thread_lease_until));
+
+        let pool = storage.pool().await.expect("pool");
+
+        let turn_lease_before_finish: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT lease_until
+            FROM turns
+            WHERE id = ?
+            "#,
+        )
+        .bind(turn.id)
+        .fetch_one(pool)
+        .await
+        .expect("load turn lease before finish");
+        assert_eq!(
+            turn_lease_before_finish,
+            Some(datetime_to_millis(turn_lease_until))
+        );
+
+        let finished = storage
+            .finish_turn(TurnFinish {
+                turn_id: turn.id,
+                status: TurnStatus::Completed,
+                final_message_id: Some("placeholder-1".to_string()),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                tool_calls: 0,
+                estimated_usage: false,
+                error_code: None,
+                ended_at: None,
+            })
+            .await
+            .expect("finish turn");
+
+        assert!(finished.lease_until.is_none());
+
+        let thread_after_finish = storage
+            .load_thread(observation.thread.id)
+            .await
+            .expect("load thread after finish")
+            .expect("thread should exist");
+        assert_eq!(thread_after_finish.lease_until, Some(thread_lease_until));
+
+        let turn_lease_after_finish: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT lease_until
+            FROM turns
+            WHERE id = ?
+            "#,
+        )
+        .bind(turn.id)
+        .fetch_one(pool)
+        .await
+        .expect("load turn lease after finish");
+        assert!(turn_lease_after_finish.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1622,12 +2042,14 @@ mod tests {
         let storage = SqliteStorage::new(unique_database_path("concurrent-observe"));
         let scope = ThreadScope::new(PlatformKind::Telegram, "chat-2", None);
         let barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let lease_until = lease_after_secs(300);
 
         let mut handles = Vec::new();
         for idx in 0..4 {
             let storage = storage.clone();
             let scope = scope.clone();
             let barrier = barrier.clone();
+            let lease_until = lease_until.clone();
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 storage
@@ -1637,6 +2059,7 @@ mod tests {
                         format!("user-{idx}"),
                         Some(format!("User {idx}")),
                         format!("hello {idx}"),
+                        Some(lease_until),
                     ))
                     .await
                     .expect("observe message")
@@ -1694,6 +2117,7 @@ mod tests {
     async fn expired_lease_starts_new_thread() {
         let storage = SqliteStorage::new(unique_database_path("lease-expiry"));
         let scope = ThreadScope::new(PlatformKind::Telegram, "chat-3", None);
+        let initial_lease_until = lease_after_secs(300);
 
         let first = storage
             .observe_message(inbound_message(
@@ -1702,12 +2126,13 @@ mod tests {
                 "user-1".to_string(),
                 Some("Alice".to_string()),
                 "hello".to_string(),
+                Some(initial_lease_until),
             ))
             .await
             .expect("observe first message");
 
         let pool = storage.pool().await.expect("pool");
-        let expired_lease_until = datetime_to_millis(Utc::now() - chrono::Duration::seconds(5));
+        let expired_lease_until = datetime_to_millis(lease_before_secs(5));
         sqlx::query(
             r#"
             UPDATE threads
@@ -1734,6 +2159,7 @@ mod tests {
                 "user-2".to_string(),
                 Some("Bob".to_string()),
                 "after timeout".to_string(),
+                Some(lease_after_secs(300)),
             ))
             .await
             .expect("observe second message");

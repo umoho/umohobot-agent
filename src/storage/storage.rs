@@ -107,6 +107,38 @@ impl Storage {
         self.backend.append_summary(summary).await
     }
 
+    pub async fn load_latest_summary(
+        &self,
+        thread_id: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        self.backend.load_latest_summary(thread_id).await
+    }
+
+    pub async fn load_latest_summary_before_seq(
+        &self,
+        thread_id: i64,
+        upto_seq: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        self.backend
+            .load_latest_summary_before_seq(thread_id, upto_seq)
+            .await
+    }
+
+    pub async fn load_recent_visible_events(
+        &self,
+        thread_id: i64,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        self.backend
+            .load_recent_visible_events(thread_id, after_seq_exclusive, before_seq_exclusive)
+            .await
+    }
+
+    pub async fn load_thread(&self, thread_id: i64) -> Result<Option<ThreadRecord>, StorageError> {
+        self.backend.load_thread(thread_id).await
+    }
+
     pub async fn record_usage(
         &self,
         usage: UsageLedgerRecord,
@@ -186,6 +218,54 @@ impl StorageBackend {
     async fn append_summary(&self, summary: SummaryWrite) -> Result<SummaryRecord, StorageError> {
         match self {
             Self::Sqlite(storage) => storage.append_summary(summary).await,
+        }
+    }
+
+    async fn load_latest_summary(
+        &self,
+        thread_id: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        match self {
+            Self::Sqlite(storage) => storage.load_latest_summary(thread_id).await,
+        }
+    }
+
+    async fn load_latest_summary_before_seq(
+        &self,
+        thread_id: i64,
+        upto_seq: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        match self {
+            Self::Sqlite(storage) => {
+                storage
+                    .load_latest_summary_before_seq(thread_id, upto_seq)
+                    .await
+            }
+        }
+    }
+
+    async fn load_recent_visible_events(
+        &self,
+        thread_id: i64,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        match self {
+            Self::Sqlite(storage) => {
+                storage
+                    .load_recent_visible_events(
+                        thread_id,
+                        after_seq_exclusive,
+                        before_seq_exclusive,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn load_thread(&self, thread_id: i64) -> Result<Option<ThreadRecord>, StorageError> {
+        match self {
+            Self::Sqlite(storage) => storage.load_thread(thread_id).await,
         }
     }
 

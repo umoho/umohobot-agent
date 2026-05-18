@@ -1,21 +1,22 @@
 use crate::{
-    agent::{AgentRequest, AgentResponse, AgentRuntime, AgentRuntimeError},
+    agent::{
+        AgentRequest, AgentResponse, AgentRuntime, AgentRuntimeError, PromptContext,
+        PromptContextBuilder,
+    },
     config::Config,
     logging::sanitize_for_log,
     platforms::{PlatformKind, PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
     storage::{
-        InboundMessageRecord, MessageObservation, Storage, StorageError, ThreadScope, TurnFinish,
-        TurnRecord, TurnStart, TurnStatus, UsageLedgerRecord, UsageScope,
+        EventRecord, InboundMessageRecord, MessageObservation, Storage, StorageError,
+        SummaryRecord, ThreadRecord, ThreadScope, TurnFinish, TurnRecord, TurnStart, TurnStatus,
+        UsageLedgerRecord, UsageScope,
     },
     tools::ToolRegistry,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
 use tracing::{debug, info, warn};
-
-const TURN_PROMPT_VERSION: i64 = 1;
-const TURN_LEASE_MINUTES: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct ReplyPlan {
@@ -31,6 +32,7 @@ pub struct ReplyPlan {
 pub struct PreparedTurn {
     pub message: PlatformMessage,
     pub observation: MessageObservation,
+    pub prompt: PromptContext,
     pub notes: Vec<String>,
 }
 
@@ -59,6 +61,7 @@ pub struct App {
     policy: PolicyEngine,
     tools: ToolRegistry,
     agent: AgentRuntime,
+    prompt_builder: PromptContextBuilder,
     platforms: Platforms,
 }
 
@@ -72,6 +75,7 @@ impl App {
         let policy = PolicyEngine::new();
         let tools = ToolRegistry::new();
         let agent = AgentRuntime::try_new(&config)?;
+        let prompt_builder = PromptContextBuilder::from_config(&config);
         let platforms = Platforms::new();
 
         Ok(Self {
@@ -80,6 +84,7 @@ impl App {
             policy,
             tools,
             agent,
+            prompt_builder,
             platforms,
         })
     }
@@ -129,7 +134,10 @@ impl App {
                     message.kind,
                     crate::platforms::PlatformMessageKind::Service
                 ),
-                lease_until: None,
+                lease_until: Some(
+                    Utc::now()
+                        + Duration::seconds(self.config.prompt.thread_idle_timeout_secs as i64),
+                ),
             })
             .await?;
 
@@ -175,9 +183,54 @@ impl App {
         notes.push(format!("thread_event_id={}", observation.event.id));
         notes.push(format!("thread_event_seq={}", observation.event.seq));
 
+        let summary = self
+            .resolve_thread_summary(&observation.thread, observation.event.seq)
+            .await?;
+        let recent_events = self
+            .load_recent_events(
+                observation.thread.id,
+                summary
+                    .as_ref()
+                    .map(|summary| {
+                        if summary.thread_id == observation.thread.id {
+                            summary.upto_seq
+                        } else {
+                            0
+                        }
+                    })
+                    .unwrap_or(0),
+                observation.event.seq.saturating_sub(1),
+            )
+            .await?;
+        let prompt = self.prompt_builder.build(
+            &observation.thread,
+            summary.as_ref(),
+            &recent_events,
+            message,
+            &observation.event,
+            &self.tools,
+        );
+
+        notes.push(format!("prompt_version={}", prompt.prompt_version));
+        notes.push(format!(
+            "prompt_estimated_tokens={}",
+            prompt.estimated_tokens
+        ));
+        notes.push(format!("prompt_sections={}", prompt.sections.len()));
+        notes.push(format!(
+            "prompt_recent_events={}",
+            prompt.recent_event_count
+        ));
+        notes.push(format!(
+            "prompt_recent_events_trimmed={}",
+            prompt.trimmed_recent_event_count
+        ));
+        notes.push(format!("prompt_summary_present={}", summary.is_some()));
+
         Ok(PreparedTurn {
             message: message.clone(),
             observation,
+            prompt,
             notes,
         })
     }
@@ -187,7 +240,8 @@ impl App {
         prepared: &PreparedTurn,
         placeholder_message_id: String,
     ) -> Result<StartedTurn, StorageError> {
-        let lease_until = Some(Utc::now() + Duration::minutes(TURN_LEASE_MINUTES));
+        let lease_until =
+            Some(Utc::now() + Duration::seconds(self.config.prompt.turn_lease_secs as i64));
         let turn = self
             .storage
             .start_turn(TurnStart {
@@ -195,7 +249,7 @@ impl App {
                 trigger_event_id: prepared.observation.event.id,
                 provider: self.agent.provider_name().to_string(),
                 model: self.agent.model_name().to_string(),
-                prompt_version: TURN_PROMPT_VERSION,
+                prompt_version: prepared.prompt.prompt_version,
                 context_hash: None,
                 placeholder_message_id: Some(placeholder_message_id),
                 lease_until,
@@ -218,7 +272,7 @@ impl App {
         } = self
             .agent
             .respond(
-                &AgentRequest::new(started.prepared.message.clone()),
+                &AgentRequest::new(started.prepared.prompt.clone()),
                 &self.tools,
             )
             .await;
@@ -341,6 +395,41 @@ impl App {
             .await
     }
 
+    async fn resolve_thread_summary(
+        &self,
+        thread: &ThreadRecord,
+        current_seq: i64,
+    ) -> Result<Option<SummaryRecord>, StorageError> {
+        let mut current_thread = Some(thread.clone());
+        while let Some(thread) = current_thread {
+            if let Some(summary) = self
+                .storage
+                .load_latest_summary_before_seq(thread.id, current_seq.saturating_sub(1))
+                .await?
+            {
+                return Ok(Some(summary));
+            }
+
+            current_thread = match thread.parent_thread_id {
+                Some(parent_thread_id) => self.storage.load_thread(parent_thread_id).await?,
+                None => None,
+            };
+        }
+
+        Ok(None)
+    }
+
+    async fn load_recent_events(
+        &self,
+        thread_id: i64,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+    ) -> Result<Vec<EventRecord>, StorageError> {
+        self.storage
+            .load_recent_visible_events(thread_id, after_seq_exclusive, before_seq_exclusive)
+            .await
+    }
+
     pub fn run(&self) {
         let _ = self.describe();
         let _ = self.storage.is_ready();
@@ -441,7 +530,7 @@ fn platform_message_content(message: &PlatformMessage) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProviderConfig, ProviderKind, RuntimeMode};
+    use crate::config::{PromptConfig, ProviderConfig, ProviderKind, RuntimeMode};
     use crate::platforms::{
         AttachmentInfo, AttachmentKind, MessageBody, PlatformKind, PlatformMessage,
         PlatformMessageKind, ReplyMetadata,
@@ -475,6 +564,7 @@ mod tests {
             max_response_chars: 4_000,
             message_edit_throttle_ms: 750,
             placeholder_text: "正在处理...".to_string(),
+            prompt: PromptConfig::default(),
             data_dir: Some(data_dir),
         }
     }
@@ -513,6 +603,7 @@ mod tests {
             max_response_chars: 4_000,
             message_edit_throttle_ms: 750,
             placeholder_text: "正在处理...".to_string(),
+            prompt: PromptConfig::default(),
             data_dir: None,
         };
         let runtime = App::new(config);
@@ -628,7 +719,7 @@ mod tests {
             .expect("load active thread after finish")
             .expect("active thread after finish");
         assert_eq!(active_after.turn_count, 1);
-        assert!(active_after.lease_until.is_none());
+        assert!(active_after.lease_until.is_some());
     }
 
     #[tokio::test]
@@ -674,7 +765,7 @@ mod tests {
             .await
             .expect("load active thread after finish")
             .expect("active thread after finish");
-        assert!(active_after.lease_until.is_none());
+        assert!(active_after.lease_until.is_some());
         assert_eq!(active_after.turn_count, 1);
     }
 }

@@ -401,7 +401,7 @@ fn parse_thread_id(value: Option<&str>) -> Option<ThreadId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProviderConfig, ProviderKind, RuntimeMode};
+    use crate::config::{PromptConfig, ProviderConfig, ProviderKind, RuntimeMode};
 
     #[test]
     fn runtime_summary_reports_placeholder_edit_flow() {
@@ -419,6 +419,7 @@ mod tests {
             max_response_chars: 4_000,
             message_edit_throttle_ms: 750,
             placeholder_text: "正在处理...".to_string(),
+            prompt: PromptConfig::default(),
             data_dir: None,
         };
         let runtime = RuntimeController::new(config);
