@@ -37,8 +37,9 @@
    - 负责权限校验、额度校验、审计记录。
 
 4. 数据与配置层
-   - 负责会话、消息、用户设置、provider 配置、用量账本、授权记录。
+   - 负责 thread、turn、event、用户设置、provider 配置、用量账本、授权记录。
    - 建议使用 SQLite 起步，后续可迁移到 PostgreSQL。
+   - 线程、存储和 prompt contract 的详细约定见 `DESIGN.md`。
 
 ## 4. 消息生命周期
 
@@ -217,7 +218,9 @@
 ### 阶段 1：MVP
 
 - Telegram 实时收发入口。
+- thread / turn / event / usage 存储骨架。
 - 占位消息 + 编辑回复。
+- prompt contract 与上下文组装。
 - agent/runtime 基础链路，默认接本机 Ollama DeepSeek。
 - 工具接口占位，不实现具体工具。
 - 用量统计与超量切断。
@@ -245,6 +248,8 @@
 5. 能力默认关闭，按需开放。
 6. 平台可切换，核心不绑定某个平台。
 7. BYOK 只改变模型来源，不改变宿主安全边界。
+8. thread 的活跃状态要在消息接纳时刷新，不要等回复结束才更新。
+9. prompt engineering 是稳定协议，不是临时拼接的长提示词。
 
 ## 13. 目录与模块约定
 

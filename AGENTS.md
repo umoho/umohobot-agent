@@ -16,6 +16,9 @@
 6. 允许用户自带 provider key，但不能把密钥当作普通聊天内容处理。
 7. 模型名、provider 和其他运行参数必须来自配置文件或环境覆盖，不能硬编码进 Rust 源码。
 8. Telegram bot token 只能通过环境变量注入，不要写入配置文件。
+9. 线程、存储和 prompt contract 的详细约定见 `DESIGN.md`，实现时不要自行改写这些术语。
+10. thread 的活跃状态要在消息接纳时刷新，turn 运行期间靠 lease 保护，避免超时 race。
+11. prompt 要按固定 contract 组装，顺序是 `thread summary`、`recent events`、`current turn`、`tool catalog`、`response policy`。
 
 ## 开发优先级
 
@@ -32,10 +35,10 @@
 ## 代码边界建议
 
 - `src/platforms/`：各聊天平台适配层。
-- `src/agent/`：AI 核心、prompt 组织、工具调用流程。
+- `src/agent/`：AI 核心、prompt 组织、thread/turn 协调、工具调用流程。
 - `src/tools/`：工具实现。
 - `src/policy/`：权限、配额、风险控制。
-- `src/storage/`：数据库访问、会话、账本、配置。
+- `src/storage/`：数据库访问、thread/event/turn/summary/usage 账本、配置。
 - `src/config/`：配置加载与环境变量。
 - 所有模块统一采用 `name.rs` + `name/name.rs` 的目录布局，禁止新增 `mod.rs`。
 - 如果需要继续拆分子模块，也必须沿用同名目录、同名文件的递归方式。
@@ -64,6 +67,20 @@
 - 每次请求后记录 usage。
 - provider 不回传 usage 时使用估算值。
 - 配额至少支持按用户、群组、会话维度统计。
+
+## 线程与存储要求
+
+- Telegram chat 默认作为 thread 作用域，forum topic 需要把 `message_thread_id` 纳入 thread key。
+- thread 关闭后只标记为 `closed`，不要删历史。
+- thread 的事实记录用 append-only event，`threads`、`turns`、`summaries`、`usage_totals` 属于派生状态。
+- 新 thread 可以继承上一 thread 的摘要，但不要继承完整历史。
+
+## Prompt 要求
+
+- prompt 不是临时拼接长文本，而是稳定 contract。
+- 上下文顺序固定为 `thread summary`、`recent events`、`current turn`、`tool catalog`、`response policy`。
+- prompt 要版本化，`turn` 和 `summary` 都应记录 `prompt_version`。
+- 不要把 placeholder 消息、内部推理过程或不该暴露的宿主状态拼进 prompt。
 
 ## 交互要求
 
