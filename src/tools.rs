@@ -1,19 +1,14 @@
 use rig::tool::server::{ToolServer, ToolServerHandle};
 
-pub mod history;
-
 pub mod protocol {
     pub use contracts::protocol::{
-        ChatBatchRequest, ChatBatchResult, ChatOp, ChatOpOutcome, ChatOpStatus, HistoryDirection,
-        HistoryItem, HistoryQueryRequest, HistoryQueryResult, HistoryWindow, MessageDraft,
+        ChatBatchRequest, ChatBatchResult, ChatOp, ChatOpOutcome, ChatOpStatus, MessageDraft,
         MessageLocator, MessageRef, ToolContext, ToolIssue, chat_batch_request_schema,
-        history_item_schema, history_query_request_schema, history_query_result_schema,
         message_draft_schema, message_locator_schema, message_ref_schema, tool_context_schema,
     };
 }
 
 pub use contracts::{ToolCall, ToolKind, ToolRegistry, ToolResult, ToolRisk, ToolSpec};
-pub use history::{HistoryQueryError, HistoryQueryTool};
 pub use protocol::*;
 
 #[derive(Clone)]

@@ -5,7 +5,7 @@ use agent::{
     config::{Config, RuntimeMode},
     platforms::{Platforms, ReplyHandle},
     storage::TurnStatus,
-    tools::{HistoryQueryTool, ToolBundle, ToolRegistry},
+    tools::{ToolBundle, ToolRegistry},
 };
 use rig::tool::server::ToolServer;
 use teloxide::types::ChatId;
@@ -36,13 +36,10 @@ impl RuntimeController {
 
     pub fn try_new(config: Config) -> Result<Self, agent::agent::AgentRuntimeError> {
         let telegram = TelegramRuntime::from_config(&config);
-        let storage = agent::storage::Storage::new(config.data_dir.clone());
         let mut tools = ToolRegistry::new();
         tools.register(ChatBatchTool::spec());
-        tools.register(HistoryQueryTool::spec());
         let tool_server_handle = ToolServer::new()
             .tool(ChatBatchTool::with_outbox(telegram.outbox()))
-            .tool(HistoryQueryTool::with_storage(storage.clone()))
             .run();
         let tool_bundle = ToolBundle::new(tools, tool_server_handle);
         let app = App::try_new_with_tool_bundle(config.clone(), tool_bundle)?;

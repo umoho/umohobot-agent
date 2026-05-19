@@ -300,7 +300,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "tracing",
 ]
 
 [[package]]
@@ -3212,8 +3211,6 @@ dependencies = [
  "agent",
  "contracts",
  "rig-core",
- "serde",
- "serde_json",
  "teloxide",
  "thiserror 2.0.18",
  "tokio",

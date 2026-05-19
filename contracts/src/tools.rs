@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolKind {
@@ -48,12 +47,10 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, spec: ToolSpec) {
-        info!(tool_name = %spec.name, risk = ?spec.risk, "tool registered");
         self.tools.insert(spec.name.clone(), spec);
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
-        debug!(tool_name = %name, exists = self.tools.contains_key(name), "tool lookup");
         self.tools.get(name)
     }
 
