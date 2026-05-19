@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::platforms::PlatformKind;
 
-use super::super::{
+use super::{
     StorageError,
     event::{EventKind, EventRecord, NewEvent},
     summary::{SummaryRecord, SummaryWrite},
