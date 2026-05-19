@@ -236,7 +236,6 @@ impl SqliteStorage {
                 model,
                 prompt_version,
                 context_hash,
-                placeholder_message_id,
                 final_message_id,
                 prompt_tokens,
                 completion_tokens,
@@ -244,7 +243,7 @@ impl SqliteStorage {
                 estimated_usage,
                 error_code,
                 lease_until
-            ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, 0, 0, 0, 0, NULL, ?)
+            ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, 0, 0, 0, 0, NULL, ?)
             "#,
         )
         .bind(turn.thread_id)
@@ -255,7 +254,6 @@ impl SqliteStorage {
         .bind(turn.model)
         .bind(turn.prompt_version)
         .bind(turn.context_hash)
-        .bind(turn.placeholder_message_id)
         .bind(lease_until_ms)
         .execute(tx.as_mut())
         .await?;
@@ -295,7 +293,6 @@ impl SqliteStorage {
             provider = %turn_row.provider,
             model = %turn_row.model,
             prompt_version = turn_row.prompt_version,
-            placeholder_message_id = %turn_row.placeholder_message_id.as_deref().unwrap_or("none"),
             lease_until = ?turn_row.lease_until,
             "turn started"
         );
@@ -1246,7 +1243,6 @@ impl SqliteStorage {
                 model,
                 prompt_version,
                 context_hash,
-                placeholder_message_id,
                 final_message_id,
                 prompt_tokens,
                 completion_tokens,
@@ -1421,7 +1417,6 @@ struct TurnRow {
     model: String,
     prompt_version: i64,
     context_hash: Option<String>,
-    placeholder_message_id: Option<String>,
     final_message_id: Option<String>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -1450,7 +1445,6 @@ impl TurnRow {
             model: self.model,
             prompt_version: self.prompt_version,
             context_hash: self.context_hash,
-            placeholder_message_id: self.placeholder_message_id,
             final_message_id: self.final_message_id,
             prompt_tokens: i64_to_u64(self.prompt_tokens)?,
             completion_tokens: i64_to_u64(self.completion_tokens)?,
@@ -1646,7 +1640,6 @@ mod tests {
                 model: "llama3.1".to_string(),
                 prompt_version: 1,
                 context_hash: Some("ctx".to_string()),
-                placeholder_message_id: Some("placeholder-1".to_string()),
                 lease_until: Some(turn_lease_until),
                 started_at: None,
             })
@@ -1965,7 +1958,6 @@ mod tests {
                 model: "llama3.1".to_string(),
                 prompt_version: 1,
                 context_hash: None,
-                placeholder_message_id: Some("placeholder-1".to_string()),
                 lease_until: Some(turn_lease_until),
                 started_at: None,
             })

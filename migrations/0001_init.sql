@@ -65,7 +65,6 @@ CREATE TABLE turns (
     model TEXT NOT NULL,
     prompt_version INTEGER NOT NULL,
     context_hash TEXT,
-    placeholder_message_id TEXT,
     final_message_id TEXT,
     prompt_tokens INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,

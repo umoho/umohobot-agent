@@ -37,7 +37,6 @@ pub struct TurnStart {
     pub model: String,
     pub prompt_version: i64,
     pub context_hash: Option<String>,
-    pub placeholder_message_id: Option<String>,
     pub lease_until: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
 }
@@ -67,7 +66,6 @@ pub struct TurnRecord {
     pub model: String,
     pub prompt_version: i64,
     pub context_hash: Option<String>,
-    pub placeholder_message_id: Option<String>,
     pub final_message_id: Option<String>,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,

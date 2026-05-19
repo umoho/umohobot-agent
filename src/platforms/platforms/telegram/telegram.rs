@@ -1,4 +1,4 @@
-use crate::{app::ReplyPlan, config::Config};
+use crate::config::Config;
 
 use super::super::{
     AttachmentInfo, AttachmentKind, MessageBody, MessageEntityInfo, PlatformKind, PlatformMessage,
@@ -11,16 +11,12 @@ use teloxide::types::{
 #[derive(Clone, Debug)]
 pub struct TelegramRuntimeConfig {
     pub bot_name: String,
-    pub placeholder_text: String,
-    pub message_edit_throttle_ms: u64,
 }
 
 impl TelegramRuntimeConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             bot_name: config.bot_name.clone(),
-            placeholder_text: config.placeholder_text.clone(),
-            message_edit_throttle_ms: config.message_edit_throttle_ms,
         }
     }
 }
@@ -28,31 +24,6 @@ impl TelegramRuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct TelegramRuntime {
     config: TelegramRuntimeConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TelegramReplyStep {
-    SendPlaceholder {
-        room_id: String,
-        text: String,
-    },
-    EditPlaceholder {
-        room_id: String,
-        text: String,
-        throttle_ms: u64,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub struct TelegramReplyScript {
-    pub platform: PlatformKind,
-    pub room_id: String,
-    pub thread_id: Option<String>,
-    pub placeholder_text: String,
-    pub final_text: String,
-    pub edit_in_place: bool,
-    pub edit_throttle_ms: u64,
-    pub steps: Vec<TelegramReplyStep>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,18 +49,7 @@ impl TelegramRuntime {
     }
 
     pub fn describe(&self) -> String {
-        format!(
-            "telegram(bot={}, edit_throttle_ms={})",
-            self.config.bot_name, self.config.message_edit_throttle_ms
-        )
-    }
-
-    pub fn supports_placeholder_edit_flow(&self) -> bool {
-        true
-    }
-
-    pub fn placeholder_text(&self) -> &str {
-        &self.config.placeholder_text
+        format!("telegram(bot={})", self.config.bot_name)
     }
 
     pub fn inbound_from_message(&self, message: &Message) -> TelegramInboundMessage {
@@ -111,35 +71,6 @@ impl TelegramRuntime {
 
     pub fn normalize_inbound(&self, inbound: TelegramInboundMessage) -> PlatformMessage {
         inbound.into()
-    }
-
-    pub fn build_reply_script(&self, plan: &ReplyPlan) -> TelegramReplyScript {
-        let placeholder_text = if plan.placeholder_text.is_empty() {
-            self.config.placeholder_text.clone()
-        } else {
-            plan.placeholder_text.clone()
-        };
-
-        TelegramReplyScript {
-            platform: plan.platform.clone(),
-            room_id: plan.room_id.clone(),
-            thread_id: plan.thread_id.clone(),
-            placeholder_text: placeholder_text.clone(),
-            final_text: plan.final_text.clone(),
-            edit_in_place: true,
-            edit_throttle_ms: self.config.message_edit_throttle_ms,
-            steps: vec![
-                TelegramReplyStep::SendPlaceholder {
-                    room_id: plan.room_id.clone(),
-                    text: placeholder_text,
-                },
-                TelegramReplyStep::EditPlaceholder {
-                    room_id: plan.room_id.clone(),
-                    text: plan.final_text.clone(),
-                    throttle_ms: self.config.message_edit_throttle_ms,
-                },
-            ],
-        }
     }
 
     pub fn reply_handle(&self, room_id: String, message_id: String) -> ReplyHandle {
@@ -408,40 +339,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_reply_script_uses_placeholder_then_edit_flow() {
+    fn describe_reports_bot_name() {
         let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
             bot_name: "bot".to_string(),
-            placeholder_text: "正在处理...".to_string(),
-            message_edit_throttle_ms: 750,
-        });
-        let script = runtime.build_reply_script(&ReplyPlan {
-            platform: PlatformKind::Telegram,
-            room_id: "room".to_string(),
-            thread_id: None,
-            placeholder_text: String::new(),
-            final_text: "done".to_string(),
-            notes: Vec::new(),
         });
 
-        assert!(script.edit_in_place);
-        assert_eq!(script.steps.len(), 2);
-        assert!(matches!(
-            script.steps[0],
-            TelegramReplyStep::SendPlaceholder { ref text, .. } if text == "正在处理..."
-        ));
-        assert!(matches!(
-            script.steps[1],
-            TelegramReplyStep::EditPlaceholder { ref text, throttle_ms, .. }
-                if text == "done" && throttle_ms == 750
-        ));
+        assert_eq!(runtime.describe(), "telegram(bot=bot)");
+    }
+
+    #[test]
+    fn reply_handle_uses_telegram_kind() {
+        let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
+            bot_name: "bot".to_string(),
+        });
+
+        let handle = runtime.reply_handle("room".to_string(), "msg".to_string());
+
+        assert_eq!(handle.platform, PlatformKind::Telegram);
+        assert_eq!(handle.room_id, "room");
+        assert_eq!(handle.message_id, "msg");
     }
 
     #[test]
     fn normalize_inbound_preserves_message_structure() {
         let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
             bot_name: "bot".to_string(),
-            placeholder_text: "正在处理...".to_string(),
-            message_edit_throttle_ms: 750,
         });
         let inbound = TelegramInboundMessage {
             room_id: "room".to_string(),

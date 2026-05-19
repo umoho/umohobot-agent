@@ -1,16 +1,16 @@
 use std::env;
 
 use crate::{
-    agent::context::PromptContext,
     config::{Config, ProviderKind},
     logging::sanitize_for_log,
     storage::TurnStatus,
     tools::ToolRegistry,
 };
 use rig::{
+    OneOrMany,
     client::CompletionClient,
     client::Nothing,
-    completion::Prompt,
+    completion::{AssistantContent, Completion},
     providers::{ollama, openai, openrouter},
 };
 use thiserror::Error;
@@ -18,20 +18,7 @@ use tracing::{debug, error, info};
 
 const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-#[derive(Clone, Debug)]
-pub struct AgentRequest {
-    pub prompt: PromptContext,
-}
-
-impl AgentRequest {
-    pub fn new(prompt: PromptContext) -> Self {
-        Self { prompt }
-    }
-
-    pub fn prompt_text(&self) -> &str {
-        self.prompt.prompt_text()
-    }
-}
+pub use crate::agent::context::AgentRequest;
 
 #[derive(Clone, Debug)]
 pub struct AgentResponse {
@@ -168,20 +155,21 @@ impl AgentRuntime {
             provider = %self.provider_backend.as_str(),
             model = %self.model,
             input_chars = prompt_text.chars().count(),
+            history_messages = request.chat_history.len(),
+            preamble_chars = request.preamble.chars().count(),
             tool_count = tools.count(),
             "agent request started"
         );
 
         let response = match &self.client {
-            AgentClient::Ollama(client) => self.query_client(client, &prompt_text).await,
-            AgentClient::OpenAICompatible(client) => self.query_client(client, &prompt_text).await,
-            AgentClient::OpenRouter(client) => self.query_client(client, &prompt_text).await,
+            AgentClient::Ollama(client) => self.query_client(client, request).await,
+            AgentClient::OpenAICompatible(client) => self.query_client(client, request).await,
+            AgentClient::OpenRouter(client) => self.query_client(client, request).await,
         };
 
         match response {
             Ok(response) => {
-                let cleaned = strip_think_sections(&response);
-                let response_chars = cleaned.chars().count();
+                let response_chars = response.chars().count();
                 let truncated = response_chars > self.max_response_chars;
 
                 info!(
@@ -193,8 +181,8 @@ impl AgentRuntime {
                 );
 
                 AgentResponse {
-                    final_text: self.truncate_response(cleaned),
-                    notes: self.notes(tools, request, Some("rig_prompt")),
+                    final_text: self.truncate_response(response),
+                    notes: self.notes(tools, request, Some("rig_completion")),
                     status: TurnStatus::Completed,
                     error_code: None,
                 }
@@ -222,13 +210,24 @@ impl AgentRuntime {
         text.chars().take(self.max_response_chars).collect()
     }
 
-    async fn query_client<C>(&self, client: &C, input: &str) -> Result<String, String>
+    async fn query_client<C>(&self, client: &C, request: &AgentRequest) -> Result<String, String>
     where
         C: CompletionClient,
     {
         let agent = client.agent(self.model.as_str()).build();
+        let completion_request = agent
+            .completion(request.prompt.clone(), request.chat_history.clone())
+            .await
+            .map_err(|err| err.to_string())?
+            .preamble(request.preamble.clone())
+            .additional_params_opt(request.additional_params.clone());
 
-        agent.prompt(input).await.map_err(|err| err.to_string())
+        let response = completion_request
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+
+        Ok(completion_choice_text(&response.choice))
     }
 
     fn notes(
@@ -237,6 +236,7 @@ impl AgentRuntime {
         request: &AgentRequest,
         done_reason: Option<&str>,
     ) -> Vec<String> {
+        let prompt_text = request.prompt_text();
         let mut notes = vec![
             format!("provider={}", self.provider_backend.as_str()),
             format!("provider_kind={}", self.provider_kind.as_str()),
@@ -244,41 +244,23 @@ impl AgentRuntime {
             format!("base_url={}", self.base_url),
             format!("user_provider_enabled={}", self.user_provider_enabled),
             format!("registered_tools={}", tools.count()),
-            format!("prompt_version={}", request.prompt.prompt_version),
-            format!(
-                "prompt_estimated_tokens={}",
-                request.prompt.estimated_tokens
-            ),
-            format!("prompt_sections={}", request.prompt.sections.len()),
-            format!("prompt_recent_events={}", request.prompt.recent_event_count),
+            format!("prompt_version={}", request.prompt_version),
+            format!("prompt_estimated_tokens={}", request.estimated_tokens),
+            format!("prompt_recent_events={}", request.recent_event_count),
             format!(
                 "prompt_recent_events_trimmed={}",
-                request.prompt.trimmed_recent_event_count
+                request.trimmed_recent_event_count
             ),
-            format!("prompt_summary_present={}", request.prompt.summary_present),
-            format!("thread_id={}", request.prompt.thread_id),
-            format!("thread_key={}", request.prompt.thread_key),
-            format!("thread_state={}", request.prompt.thread_state),
-            format!("input_kind={}", request.prompt.current_turn.kind.as_str()),
-            format!("input_body_kind={}", request.prompt.current_turn.body_kind),
-            format!(
-                "input_entities={}",
-                request.prompt.current_turn.entity_count
-            ),
-            format!(
-                "input_attachments={}",
-                request.prompt.current_turn.attachment_count
-            ),
-            format!("input_reply={}", request.prompt.current_turn.reply_present),
-            format!("input_mention={}", request.prompt.current_turn.mention),
-            format!(
-                "input_text_present={}",
-                request.prompt.current_turn.text_present
-            ),
-            format!(
-                "input_speaker={}",
-                request.prompt.current_turn.sender.label()
-            ),
+            format!("prompt_summary_present={}", request.summary_present),
+            format!("prompt_history_messages={}", request.chat_history.len()),
+            format!("prompt_preamble_chars={}", request.preamble.chars().count()),
+            format!("prompt_text_chars={}", prompt_text.chars().count()),
+            format!("prompt_tool_count={}", request.tool_count),
+            format!("thread_id={}", request.thread_id),
+            format!("thread_key={}", request.thread_key),
+            format!("thread_state={}", request.thread_state),
+            format!("input_role=user"),
+            format!("input_text_present={}", !prompt_text.trim().is_empty()),
         ];
         if let Some(done_reason) = done_reason {
             notes.push(format!("done_reason={done_reason}"));
@@ -388,25 +370,24 @@ fn is_openrouter_base_url(base_url: &str) -> bool {
     normalize_remote_base_url(base_url) == OPENROUTER_API_BASE_URL
 }
 
-fn strip_think_sections(text: &str) -> String {
-    if let Some(close_index) = text.find("</think>") {
-        let after = text[close_index + "</think>".len()..].trim();
-        if !after.is_empty() {
-            return after.to_string();
-        }
-    }
-
-    text.trim().to_string()
+fn completion_choice_text(choice: &OneOrMany<AssistantContent>) -> String {
+    choice
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::context::{
-        PromptContext, PromptCurrentTurn, PromptSection, PromptSectionKind, PromptSpeaker,
-    };
+    use crate::agent::context::AgentRequest;
     use crate::config::{PromptConfig, ProviderConfig, ProviderKind, RuntimeMode};
-    use crate::platforms::{PlatformKind, PlatformMessageKind};
+    use rig::OneOrMany;
+    use rig::message::{AssistantContent, Reasoning};
 
     #[test]
     fn normalize_ollama_base_url_strips_api_suffix() {
@@ -475,8 +456,6 @@ mod tests {
             },
             allow_user_provider: false,
             max_response_chars: 4_000,
-            message_edit_throttle_ms: 750,
-            placeholder_text: "正在处理...".to_string(),
             prompt: PromptConfig::default(),
             data_dir: None,
         };
@@ -492,66 +471,41 @@ mod tests {
     }
 
     #[test]
-    fn agent_request_prompt_text_uses_rendered_prompt_context() {
-        let request = AgentRequest::new(prompt_context("rendered prompt"));
+    fn agent_request_prompt_text_uses_structured_message() {
+        let request = agent_request("rendered prompt");
 
         assert_eq!(request.prompt_text(), "rendered prompt");
     }
 
     #[test]
-    fn strip_think_sections_prefers_final_answer_after_think_block() {
-        assert_eq!(
-            strip_think_sections("<think>reasoning</think>\n\n最终答案"),
-            "最终答案"
-        );
+    fn completion_choice_text_prefers_visible_answer_over_reasoning() {
+        let choice = OneOrMany::many(vec![
+            AssistantContent::Reasoning(Reasoning::new("reasoning")),
+            AssistantContent::text("最终答案"),
+        ])
+        .unwrap();
+
+        assert_eq!(completion_choice_text(&choice), "最终答案");
     }
 
-    fn prompt_context(rendered_prompt_text: &str) -> PromptContext {
-        PromptContext {
+    fn agent_request(prompt_text: &str) -> AgentRequest {
+        AgentRequest {
             prompt_version: 1,
             thread_id: 1,
             thread_key: "telegram:room".to_string(),
             thread_state: "active".to_string(),
             summary_present: false,
-            current_turn: PromptCurrentTurn {
-                event_id: 1,
-                message_id: "msg".to_string(),
-                seq: 1,
-                sender: PromptSpeaker::new("user", Some("Alice".to_string())),
-                platform: PlatformKind::Telegram.as_str().to_string(),
-                room_id: "room".to_string(),
-                thread_id: None,
-                kind: PlatformMessageKind::Text.as_str().to_string(),
-                body_kind: "text".to_string(),
-                text_present: true,
-                text_chars: 5,
-                entity_count: 0,
-                attachment_count: 0,
-                reply_present: false,
-                reply_message_id: None,
-                reply_sender_id: None,
-                mention: false,
-                body_text: "hello".to_string(),
-                rendered_text: "hello".to_string(),
-                estimated_tokens: 1,
-                trimmed: false,
-            },
-            recent_events: vec![],
-            tools: vec![],
-            sections: vec![PromptSection::new(
-                PromptSectionKind::SystemRules,
-                "system rules",
-                false,
-            )],
-            rendered_prompt: rendered_prompt_text.to_string(),
-            estimated_tokens: rendered_prompt_text.chars().count(),
+            preamble: String::new(),
+            prompt: rig::message::Message::user(prompt_text),
+            chat_history: vec![],
+            additional_params: None,
+            estimated_tokens: 1,
             recent_event_count: 0,
             trimmed_recent_event_count: 0,
             trimmed_summary_chars: 0,
             trimmed_current_turn_chars: 0,
-            trimmed_tool_catalog_chars: 0,
-            trimmed_response_policy_chars: 0,
-            trimmed_system_rules_chars: 0,
+            trimmed_preamble_chars: 0,
+            tool_count: 0,
         }
     }
 }

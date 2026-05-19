@@ -1,11 +1,8 @@
 use crate::{
-    agent::{
-        AgentRequest, AgentResponse, AgentRuntime, AgentRuntimeError, PromptContext,
-        PromptContextBuilder,
-    },
+    agent::{AgentRequest, AgentRequestBuilder, AgentResponse, AgentRuntime, AgentRuntimeError},
     config::Config,
     logging::sanitize_for_log,
-    platforms::{PlatformKind, PlatformMessage, Platforms},
+    platforms::{PlatformMessage, Platforms},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
     storage::{
         EventRecord, InboundMessageRecord, MessageObservation, Storage, StorageError,
@@ -19,20 +16,10 @@ use serde_json::json;
 use tracing::{debug, info, warn};
 
 #[derive(Clone, Debug)]
-pub struct ReplyPlan {
-    pub platform: PlatformKind,
-    pub room_id: String,
-    pub thread_id: Option<String>,
-    pub placeholder_text: String,
-    pub final_text: String,
-    pub notes: Vec<String>,
-}
-
-#[derive(Clone, Debug)]
 pub struct PreparedTurn {
     pub message: PlatformMessage,
     pub observation: MessageObservation,
-    pub prompt: PromptContext,
+    pub request: AgentRequest,
     pub notes: Vec<String>,
 }
 
@@ -61,7 +48,7 @@ pub struct App {
     policy: PolicyEngine,
     tools: ToolRegistry,
     agent: AgentRuntime,
-    prompt_builder: PromptContextBuilder,
+    prompt_builder: AgentRequestBuilder,
     platforms: Platforms,
 }
 
@@ -75,7 +62,7 @@ impl App {
         let policy = PolicyEngine::new();
         let tools = ToolRegistry::new();
         let agent = AgentRuntime::try_new(&config)?;
-        let prompt_builder = PromptContextBuilder::from_config(&config);
+        let prompt_builder = AgentRequestBuilder::from_config(&config);
         let platforms = Platforms::new();
 
         Ok(Self {
@@ -91,11 +78,10 @@ impl App {
 
     pub fn describe(&self) -> String {
         format!(
-            "bot={} provider={} platforms={} placeholder_edit_flow={}",
+            "bot={} provider={} platforms={}",
             self.config.bot_name,
             self.agent.describe(),
-            self.platforms.describe(),
-            self.platforms.supports_placeholder_edit_flow()
+            self.platforms.describe()
         )
     }
 
@@ -202,7 +188,7 @@ impl App {
                 observation.event.seq.saturating_sub(1),
             )
             .await?;
-        let prompt = self.prompt_builder.build(
+        let request = self.prompt_builder.build(
             &observation.thread,
             summary.as_ref(),
             &recent_events,
@@ -211,35 +197,37 @@ impl App {
             &self.tools,
         );
 
-        notes.push(format!("prompt_version={}", prompt.prompt_version));
+        notes.push(format!("prompt_version={}", request.prompt_version));
         notes.push(format!(
             "prompt_estimated_tokens={}",
-            prompt.estimated_tokens
+            request.estimated_tokens
         ));
-        notes.push(format!("prompt_sections={}", prompt.sections.len()));
+        notes.push(format!(
+            "prompt_history_messages={}",
+            request.chat_history.len()
+        ));
         notes.push(format!(
             "prompt_recent_events={}",
-            prompt.recent_event_count
+            request.recent_event_count
         ));
         notes.push(format!(
             "prompt_recent_events_trimmed={}",
-            prompt.trimmed_recent_event_count
+            request.trimmed_recent_event_count
         ));
-        notes.push(format!("prompt_summary_present={}", summary.is_some()));
+        notes.push(format!(
+            "prompt_summary_present={}",
+            request.summary_present
+        ));
 
         Ok(PreparedTurn {
             message: message.clone(),
             observation,
-            prompt,
+            request,
             notes,
         })
     }
 
-    pub async fn start_turn(
-        &self,
-        prepared: &PreparedTurn,
-        placeholder_message_id: String,
-    ) -> Result<StartedTurn, StorageError> {
+    pub async fn start_turn(&self, prepared: &PreparedTurn) -> Result<StartedTurn, StorageError> {
         let lease_until =
             Some(Utc::now() + Duration::seconds(self.config.prompt.turn_lease_secs as i64));
         let turn = self
@@ -249,9 +237,8 @@ impl App {
                 trigger_event_id: prepared.observation.event.id,
                 provider: self.agent.provider_name().to_string(),
                 model: self.agent.model_name().to_string(),
-                prompt_version: prepared.prompt.prompt_version,
+                prompt_version: prepared.request.prompt_version,
                 context_hash: None,
-                placeholder_message_id: Some(placeholder_message_id),
                 lease_until,
                 started_at: None,
             })
@@ -271,10 +258,7 @@ impl App {
             error_code: agent_error_code,
         } = self
             .agent
-            .respond(
-                &AgentRequest::new(started.prepared.prompt.clone()),
-                &self.tools,
-            )
+            .respond(&started.prepared.request, &self.tools)
             .await;
         let mut notes = Vec::with_capacity(agent_notes.len() + 4);
         notes.append(&mut agent_notes);
@@ -562,8 +546,6 @@ mod tests {
             },
             allow_user_provider: false,
             max_response_chars: 4_000,
-            message_edit_throttle_ms: 750,
-            placeholder_text: "正在处理...".to_string(),
             prompt: PromptConfig::default(),
             data_dir: Some(data_dir),
         }
@@ -588,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_summary_reports_placeholder_edit_flow() {
+    fn runtime_summary_reports_provider_and_platforms() {
         let config = Config {
             bot_name: "bot".to_string(),
             runtime_mode: RuntimeMode::Telegram,
@@ -601,8 +583,6 @@ mod tests {
             },
             allow_user_provider: false,
             max_response_chars: 4_000,
-            message_edit_throttle_ms: 750,
-            placeholder_text: "正在处理...".to_string(),
             prompt: PromptConfig::default(),
             data_dir: None,
         };
@@ -610,7 +590,8 @@ mod tests {
         let summary = runtime.describe();
 
         assert!(summary.contains("provider="));
-        assert!(summary.contains("placeholder_edit_flow=true"));
+        assert!(summary.contains("platforms="));
+        assert!(!summary.contains("placeholder_edit_flow"));
     }
 
     #[test]
@@ -668,14 +649,7 @@ mod tests {
         let prepared = app.prepare_turn(&message).await.expect("prepare turn");
         assert_eq!(prepared.observation.thread.turn_count, 0);
 
-        let started = app
-            .start_turn(&prepared, "placeholder-1".to_string())
-            .await
-            .expect("start turn");
-        assert_eq!(
-            started.turn.placeholder_message_id.as_deref(),
-            Some("placeholder-1")
-        );
+        let started = app.start_turn(&prepared).await.expect("start turn");
         assert_eq!(started.turn.status, TurnStatus::Running);
 
         let active = app
@@ -703,14 +677,14 @@ mod tests {
                 &started,
                 &outcome,
                 TurnStatus::Completed,
-                Some("placeholder-1".to_string()),
+                Some("message-1".to_string()),
                 None,
             )
             .await
             .expect("finish turn");
 
         assert_eq!(finished.status, TurnStatus::Completed);
-        assert_eq!(finished.final_message_id.as_deref(), Some("placeholder-1"));
+        assert_eq!(finished.final_message_id.as_deref(), Some("message-1"));
 
         let active_after = app
             .storage
@@ -728,10 +702,7 @@ mod tests {
         let message = test_message();
 
         let prepared = app.prepare_turn(&message).await.expect("prepare turn");
-        let started = app
-            .start_turn(&prepared, "placeholder-1".to_string())
-            .await
-            .expect("start turn");
+        let started = app.start_turn(&prepared).await.expect("start turn");
 
         let outcome = TurnOutcome {
             final_text: "rig 请求失败：boom".to_string(),
