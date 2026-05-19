@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "contracts", "tools-telegram"]
+members = [".", "contracts", "tools-telegram", "trigger-telegram", "telegram-host"]
 resolver = "2"
 
 [package]

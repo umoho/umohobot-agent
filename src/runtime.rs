@@ -43,7 +43,7 @@ impl RuntimeController {
             runtime_mode: self.config.runtime_mode.clone(),
             app_description: self.app.describe(),
             platforms_description: self.platforms.describe(),
-            telegram_description: "telegram host moved to tools-telegram".to_string(),
+            telegram_description: "telegram host moved to telegram-host".to_string(),
         }
     }
 

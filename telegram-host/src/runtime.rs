@@ -7,11 +7,13 @@ use agent::{
     storage::TurnStatus,
     tools::{ToolBundle, ToolRegistry},
 };
+use chrono::Duration;
 use rig::tool::server::ToolServer;
 use teloxide::types::ChatId;
 use tracing::{debug, error, info, warn};
 
-use crate::{chat::ChatBatchTool, telegram::TelegramRuntime};
+use tools_telegram::{ChatBatchTool, TelegramOutbox};
+use trigger_telegram::{TelegramTrigger, TelegramTriggerResult};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeSummary {
@@ -26,7 +28,8 @@ pub struct RuntimeController {
     config: Config,
     app: App,
     platforms: Platforms,
-    telegram: TelegramRuntime,
+    trigger: TelegramTrigger,
+    outbox: TelegramOutbox,
 }
 
 impl RuntimeController {
@@ -35,21 +38,26 @@ impl RuntimeController {
     }
 
     pub fn try_new(config: Config) -> Result<Self, agent::agent::AgentRuntimeError> {
-        let telegram = TelegramRuntime::from_config(&config);
+        let outbox = TelegramOutbox::new();
         let mut tools = ToolRegistry::new();
         tools.register(ChatBatchTool::spec());
         let tool_server_handle = ToolServer::new()
-            .tool(ChatBatchTool::with_outbox(telegram.outbox()))
+            .tool(ChatBatchTool::with_outbox(outbox.clone()))
             .run();
         let tool_bundle = ToolBundle::new(tools, tool_server_handle);
         let app = App::try_new_with_tool_bundle(config.clone(), tool_bundle)?;
+        let trigger = TelegramTrigger::new(
+            config.bot_name.clone(),
+            Duration::seconds(config.prompt.thread_idle_timeout_secs as i64),
+        );
         let platforms = Platforms::new();
 
         Ok(Self {
             config,
             app,
             platforms,
-            telegram,
+            trigger,
+            outbox,
         })
     }
 
@@ -58,7 +66,10 @@ impl RuntimeController {
             runtime_mode: self.config.runtime_mode.clone(),
             app_description: self.app.describe(),
             platforms_description: self.platforms.describe(),
-            telegram_description: self.telegram.describe(),
+            telegram_description: format!(
+                "telegram(trigger idle_timeout={}s)",
+                self.config.prompt.thread_idle_timeout_secs
+            ),
         }
     }
 
@@ -75,13 +86,21 @@ impl RuntimeController {
             return Ok(());
         }
 
-        let inbound = self.telegram.inbound_from_message(msg);
-        let platform_message = self.telegram.normalize_inbound(inbound);
+        let TelegramTriggerResult {
+            normalized,
+            thread_scope,
+            was_new_thread,
+        } = self.trigger.trigger(msg);
+        let platform_message = normalized.platform_message;
+        let thread_scope = agent::storage::ThreadScope::new(thread_scope.to_string());
         let thread_id = platform_message.thread_id.as_deref();
+
         info!(
             platform = %platform_message.platform.as_str(),
             chat_id = %platform_message.room_id,
             thread_id = %platform_message.thread_id.as_deref().unwrap_or("none"),
+            thread_key = %thread_scope.thread_key(),
+            was_new_thread,
             message_id = %platform_message.message_id,
             sender_id = %platform_message.sender_id,
             kind = %platform_message.kind.as_str(),
@@ -92,7 +111,14 @@ impl RuntimeController {
             "received telegram message"
         );
 
-        let placeholder_message = match self.telegram.send_placeholder(msg.chat.id, thread_id).await
+        let placeholder_message = match self
+            .outbox
+            .send_placeholder(
+                msg.chat.id,
+                thread_id,
+                self.config.placeholder_text.as_str(),
+            )
+            .await
         {
             Ok(message) => Some(message),
             Err(err) => {
@@ -106,7 +132,7 @@ impl RuntimeController {
             }
         };
 
-        if let Err(err) = self.telegram.send_typing(msg.chat.id, thread_id).await {
+        if let Err(err) = self.outbox.send_typing(msg.chat.id, thread_id).await {
             warn!(
                 error = %err,
                 chat_id = %msg.chat.id,
@@ -115,14 +141,16 @@ impl RuntimeController {
             );
         }
 
-        let prepared = match self.app.prepare_turn(&platform_message).await {
+        let prepared = match self
+            .app
+            .prepare_turn(&thread_scope, &platform_message, None)
+            .await
+        {
             Ok(prepared) => prepared,
             Err(err) => {
                 error!(
                     error = %err,
-                    platform = %platform_message.platform.as_str(),
-                    room_id = %platform_message.room_id,
-                    thread_id = %platform_message.thread_id.as_deref().unwrap_or("none"),
+                    thread_key = %thread_scope.thread_key(),
                     message_id = %platform_message.message_id,
                     "failed to prepare turn"
                 );
@@ -183,7 +211,7 @@ impl RuntimeController {
     ) {
         if let Some(existing_message) = existing_message {
             if let Err(err) = self
-                .telegram
+                .outbox
                 .edit_text(chat_id, existing_message.message_id.as_str(), error_text)
                 .await
             {
@@ -237,13 +265,13 @@ impl RuntimeController {
             bot_name = %self.config.bot_name,
             provider = %self.app.describe(),
             platforms = %self.platforms.describe(),
-            telegram_description = %self.telegram.describe(),
+            telegram_description = %self.summary().telegram_description,
             data_dir = ?self.config.data_dir,
             telegram_token_present = self.config.telegram_bot_token.is_some(),
             "runtime starting"
         );
         let bot = teloxide::Bot::new(token);
-        self.telegram.bind_bot(bot.clone());
+        self.outbox.bind_bot(bot.clone());
         let runtime = self.clone();
 
         teloxide::repl(
@@ -263,16 +291,16 @@ impl RuntimeController {
 pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let config = Config::load()?;
     info!(
-            runtime_mode = ?config.runtime_mode,
-            bot_name = %config.bot_name,
-            provider_kind = ?config.default_provider.kind,
-            model = %config.default_provider.model,
-            allow_user_provider = config.allow_user_provider,
-            data_dir = ?config.data_dir,
-            telegram_token_present = config.telegram_bot_token.is_some(),
-            "configuration loaded"
+        runtime_mode = ?config.runtime_mode,
+        bot_name = %config.bot_name,
+        data_dir = ?config.data_dir,
+        "configuration loaded"
     );
-    let runtime = RuntimeController::new(config);
+    let runtime = RuntimeController::try_new(config)?;
     runtime.run().await?;
     Ok(())
+}
+
+pub mod runtime {
+    pub use super::{RuntimeController, RuntimeSummary, run};
 }

@@ -1133,7 +1133,7 @@ mod tests {
     fn sample_thread() -> ThreadRecord {
         ThreadRecord {
             id: 1,
-            scope: crate::storage::ThreadScope::new(PlatformKind::Telegram, "chat-1", None),
+            thread_key: crate::storage::ThreadKey::new("thread-1"),
             state: crate::storage::ThreadState::Active,
             opened_at: fixed_time(),
             last_activity_at: fixed_time(),

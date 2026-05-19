@@ -601,7 +601,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2884,6 +2884,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20f34339676cdcab560c9a82300c4c2581f68b9369aedf0fae86f2ff9565ff3e"
 
 [[package]]
+name = "telegram-host"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "chrono",
+ "rig-core",
+ "teloxide",
+ "thiserror 2.0.18",
+ "tokio",
+ "tools-telegram",
+ "tracing",
+ "trigger-telegram",
+]
+
+[[package]]
 name = "teloxide"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3208,12 +3223,10 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 name = "tools-telegram"
 version = "0.1.0"
 dependencies = [
- "agent",
  "contracts",
  "rig-core",
  "teloxide",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -3334,6 +3347,17 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "trigger-telegram"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "contracts",
+ "serde",
+ "serde_json",
+ "teloxide",
 ]
 
 [[package]]

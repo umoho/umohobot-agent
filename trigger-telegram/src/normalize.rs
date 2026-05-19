@@ -1,35 +1,11 @@
-use agent::config::Config;
-
 use contracts::{
     AttachmentInfo, AttachmentKind, MessageBody, MessageEntityInfo, PlatformKind, PlatformMessage,
-    PlatformMessageKind, ReplyHandle, ReplyMetadata,
+    PlatformMessageKind, ReplyMetadata,
 };
+use serde::{Deserialize, Serialize};
+use teloxide::types::{Document, Message, PhotoSize, Sticker, Voice};
 
-use crate::outbox::TelegramOutbox;
-use teloxide::types::{ChatId, Document, Message, PhotoSize, Sticker, Voice};
-
-#[derive(Clone, Debug)]
-pub struct TelegramRuntimeConfig {
-    pub bot_name: String,
-    pub placeholder_text: String,
-}
-
-impl TelegramRuntimeConfig {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
-            bot_name: config.bot_name.clone(),
-            placeholder_text: config.placeholder_text.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct TelegramRuntime {
-    config: TelegramRuntimeConfig,
-    outbox: TelegramOutbox,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelegramInboundMessage {
     pub room_id: String,
     pub thread_id: Option<String>,
@@ -42,31 +18,19 @@ pub struct TelegramInboundMessage {
     pub is_mention: bool,
 }
 
-impl TelegramRuntime {
-    pub fn new(config: TelegramRuntimeConfig) -> Self {
-        Self {
-            config,
-            outbox: TelegramOutbox::new(),
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramNormalizedMessage {
+    pub inbound: TelegramInboundMessage,
+    pub platform_message: PlatformMessage,
+}
 
-    pub fn from_config(config: &Config) -> Self {
-        Self::new(TelegramRuntimeConfig::from_config(config))
-    }
-
-    pub fn describe(&self) -> String {
-        format!("telegram(bot={})", self.config.bot_name)
-    }
-
-    pub fn placeholder_text(&self) -> &str {
-        &self.config.placeholder_text
-    }
-
-    pub fn inbound_from_message(&self, message: &Message) -> TelegramInboundMessage {
+impl TelegramInboundMessage {
+    #[must_use]
+    pub fn from_message(message: &Message, bot_name: impl AsRef<str>) -> Self {
         let snapshot = snapshot_message(message);
-        let is_mention = body_mentions_bot(&snapshot.body, &self.config.bot_name);
+        let is_mention = body_mentions_bot(&snapshot.body, bot_name.as_ref());
 
-        TelegramInboundMessage {
+        Self {
             room_id: message.chat.id.to_string(),
             thread_id: message.thread_id.map(|thread_id| thread_id.0.to_string()),
             message_id: message.id.to_string(),
@@ -78,69 +42,18 @@ impl TelegramRuntime {
             is_mention,
         }
     }
+}
 
-    pub fn normalize_inbound(&self, inbound: TelegramInboundMessage) -> PlatformMessage {
-        inbound.into()
-    }
+impl TelegramNormalizedMessage {
+    #[must_use]
+    pub fn from_message(message: &Message, bot_name: impl AsRef<str>) -> Self {
+        let inbound = TelegramInboundMessage::from_message(message, bot_name);
+        let platform_message = inbound.clone().into();
 
-    pub fn bind_bot(&self, bot: teloxide::Bot) {
-        self.outbox.bind_bot(bot);
-    }
-
-    pub fn outbox(&self) -> TelegramOutbox {
-        self.outbox.clone()
-    }
-
-    pub fn reply_handle(&self, room_id: String, message_id: String) -> ReplyHandle {
-        ReplyHandle {
-            platform: PlatformKind::Telegram,
-            room_id,
-            message_id,
+        Self {
+            inbound,
+            platform_message,
         }
-    }
-
-    pub async fn send_placeholder(
-        &self,
-        chat_id: ChatId,
-        thread_id: Option<&str>,
-    ) -> Result<ReplyHandle, teloxide::RequestError> {
-        self.outbox
-            .send_placeholder(chat_id, thread_id, self.placeholder_text())
-            .await
-    }
-
-    pub async fn send_text(
-        &self,
-        chat_id: ChatId,
-        thread_id: Option<&str>,
-        text: &str,
-    ) -> Result<ReplyHandle, teloxide::RequestError> {
-        self.outbox.send_text(chat_id, thread_id, text).await
-    }
-
-    pub async fn edit_text(
-        &self,
-        chat_id: ChatId,
-        message_id: &str,
-        text: &str,
-    ) -> Result<(), teloxide::RequestError> {
-        self.outbox.edit_text(chat_id, message_id, text).await
-    }
-
-    pub async fn delete_message(
-        &self,
-        chat_id: ChatId,
-        message_id: &str,
-    ) -> Result<(), teloxide::RequestError> {
-        self.outbox.delete_message(chat_id, message_id).await
-    }
-
-    pub async fn send_typing(
-        &self,
-        chat_id: ChatId,
-        thread_id: Option<&str>,
-    ) -> Result<(), teloxide::RequestError> {
-        self.outbox.send_typing(chat_id, thread_id).await
     }
 }
 
@@ -399,103 +312,88 @@ fn is_service_message(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use teloxide::types::Message;
 
-    #[test]
-    fn describe_reports_bot_name() {
-        let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
-            bot_name: "bot".to_string(),
-            placeholder_text: "正在处理...".to_string(),
-        });
-
-        assert_eq!(runtime.describe(), "telegram(bot=bot)");
-    }
-
-    #[test]
-    fn reply_handle_uses_telegram_kind() {
-        let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
-            bot_name: "bot".to_string(),
-            placeholder_text: "正在处理...".to_string(),
-        });
-
-        let handle = runtime.reply_handle("room".to_string(), "msg".to_string());
-
-        assert_eq!(handle.platform, PlatformKind::Telegram);
-        assert_eq!(handle.room_id, "room");
-        assert_eq!(handle.message_id, "msg");
+    fn message_from_value(value: serde_json::Value) -> Message {
+        serde_json::from_value(value).expect("telegram message")
     }
 
     #[test]
     fn normalize_inbound_preserves_message_structure() {
-        let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
-            bot_name: "bot".to_string(),
-            placeholder_text: "正在处理...".to_string(),
-        });
-        let inbound = TelegramInboundMessage {
-            room_id: "room".to_string(),
-            thread_id: None,
-            message_id: "msg-1".to_string(),
-            sender_id: "user-1".to_string(),
-            kind: PlatformMessageKind::Photo,
-            body: MessageBody::Caption {
-                text: "看看这张图".to_string(),
-                entities: vec![],
+        let message = message_from_value(json!({
+            "message_id": 42,
+            "date": 1_700_000_000,
+            "chat": {
+                "id": -100_123,
+                "type": "supergroup",
+                "title": "Support",
+                "is_forum": true,
+                "username": "support"
             },
-            attachments: vec![AttachmentInfo {
-                kind: AttachmentKind::Image,
-                file_id: Some("file-id".to_string()),
-                file_unique_id: Some("file-unique-id".to_string()),
-                file_name: None,
-                mime_type: None,
-                url: None,
-                width: Some(1024),
-                height: Some(768),
-                size_bytes: Some(12_345),
-            }],
-            reply: Some(ReplyMetadata {
-                message_id: "reply-1".to_string(),
-                sender_id: "user-2".to_string(),
-                kind: PlatformMessageKind::Text,
-                body: MessageBody::Text {
-                    text: "原始消息".to_string(),
-                    entities: vec![],
+            "from": {
+                "id": 1001,
+                "is_bot": false,
+                "first_name": "Alice",
+                "username": "alice"
+            },
+            "message_thread_id": 777,
+            "text": "@Bot 请看",
+            "entities": [
+                {
+                    "type": "mention",
+                    "offset": 0,
+                    "length": 4
+                }
+            ],
+            "reply_to_message": {
+                "message_id": 41,
+                "date": 1_699_999_990,
+                "chat": {
+                    "id": -100_123,
+                    "type": "supergroup",
+                    "title": "Support",
+                    "is_forum": true,
+                    "username": "support"
                 },
-                attachments: vec![],
-            }),
-            is_mention: true,
-        };
+                "from": {
+                    "id": 1002,
+                    "is_bot": false,
+                    "first_name": "Bob"
+                },
+                "text": "原始消息"
+            }
+        }));
 
-        let normalized = runtime.normalize_inbound(inbound.clone());
+        let normalized = TelegramNormalizedMessage::from_message(&message, "bot");
 
-        assert_eq!(normalized.platform, PlatformKind::Telegram);
-        assert_eq!(normalized.room_id, inbound.room_id);
-        assert_eq!(normalized.message_id, inbound.message_id);
-        assert_eq!(normalized.sender_id, inbound.sender_id);
-        assert_eq!(normalized.kind, inbound.kind);
-        assert_eq!(normalized.body, inbound.body);
-        assert_eq!(normalized.attachments, inbound.attachments);
-        assert_eq!(normalized.reply, inbound.reply);
-        assert!(normalized.is_mention);
-    }
+        assert_eq!(normalized.inbound.room_id, "-100123");
+        assert_eq!(normalized.inbound.thread_id, Some("777".to_string()));
+        assert_eq!(normalized.inbound.message_id, "42");
+        assert_eq!(normalized.inbound.sender_id, "1001");
+        assert_eq!(normalized.inbound.kind, PlatformMessageKind::Text);
+        assert!(normalized.inbound.is_mention);
+        assert!(normalized.inbound.attachments.is_empty());
+        assert_eq!(normalized.platform_message.platform, PlatformKind::Telegram);
+        assert_eq!(normalized.platform_message.room_id, "-100123");
+        assert_eq!(
+            normalized.platform_message.thread_id.as_deref(),
+            Some("777")
+        );
+        assert_eq!(normalized.platform_message.message_id, "42");
+        assert_eq!(normalized.platform_message.sender_id, "1001");
+        assert_eq!(normalized.platform_message.kind, PlatformMessageKind::Text);
+        assert_eq!(normalized.platform_message.text(), Some("@Bot 请看"));
+        assert!(normalized.platform_message.is_mention);
 
-    #[test]
-    fn body_mentions_bot_detects_mentions_and_bot_commands() {
-        let mention_body = MessageBody::Text {
-            text: "@Bot 请处理".to_string(),
-            entities: vec![MessageEntityInfo {
-                kind: "Mention".to_string(),
-                text: "@Bot".to_string(),
-            }],
-        };
-        let command_body = MessageBody::Text {
-            text: "/start@Bot".to_string(),
-            entities: vec![MessageEntityInfo {
-                kind: "BotCommand".to_string(),
-                text: "/start@Bot".to_string(),
-            }],
-        };
-
-        assert!(body_mentions_bot(&mention_body, "bot"));
-        assert!(body_mentions_bot(&command_body, "bot"));
-        assert!(!body_mentions_bot(&MessageBody::Empty, "bot"));
+        let reply = normalized
+            .platform_message
+            .reply
+            .as_ref()
+            .expect("reply metadata");
+        assert_eq!(reply.message_id, "41");
+        assert_eq!(reply.sender_id, "1002");
+        assert_eq!(reply.kind, PlatformMessageKind::Text);
+        assert_eq!(reply.body.text(), Some("原始消息"));
     }
 }

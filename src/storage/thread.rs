@@ -3,8 +3,6 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::platforms::{PlatformKind, PlatformMessage};
-
 use super::event::EventRecord;
 
 pub mod history;
@@ -46,44 +44,18 @@ impl From<&str> for ThreadKey {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThreadScope {
-    pub platform: PlatformKind,
-    pub chat_id: String,
-    pub topic_id: Option<String>,
+    thread_key: ThreadKey,
 }
 
 impl ThreadScope {
-    pub fn new(
-        platform: PlatformKind,
-        chat_id: impl Into<String>,
-        topic_id: Option<String>,
-    ) -> Self {
+    pub fn new(thread_key: impl Into<String>) -> Self {
         Self {
-            platform,
-            chat_id: chat_id.into(),
-            topic_id,
+            thread_key: ThreadKey::new(thread_key),
         }
     }
 
-    pub fn from_platform_message(message: &PlatformMessage) -> Self {
-        Self {
-            platform: message.platform,
-            chat_id: message.room_id.clone(),
-            topic_id: message.thread_id.clone(),
-        }
-    }
-
-    pub fn thread_key(&self) -> ThreadKey {
-        let key = match self.topic_id.as_deref() {
-            Some(topic_id) => format!(
-                "{}:{}:topic:{}",
-                self.platform.as_str(),
-                self.chat_id,
-                topic_id
-            ),
-            None => format!("{}:{}", self.platform.as_str(), self.chat_id),
-        };
-
-        ThreadKey::new(key)
+    pub fn thread_key(&self) -> &ThreadKey {
+        &self.thread_key
     }
 }
 
@@ -116,7 +88,7 @@ impl ThreadState {
 #[derive(Clone, Debug)]
 pub struct ThreadRecord {
     pub id: i64,
-    pub scope: ThreadScope,
+    pub thread_key: ThreadKey,
     pub state: ThreadState,
     pub opened_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
@@ -129,14 +101,15 @@ pub struct ThreadRecord {
 }
 
 impl ThreadRecord {
-    pub fn thread_key(&self) -> ThreadKey {
-        self.scope.thread_key()
+    pub fn thread_key(&self) -> &ThreadKey {
+        &self.thread_key
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct InboundMessageRecord {
     pub scope: ThreadScope,
+    pub parent_thread_id: Option<i64>,
     pub platform_message_id: String,
     pub sender_id: String,
     pub sender_name: Option<String>,
@@ -167,9 +140,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn thread_scope_formats_for_forum_topics() {
-        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-1", Some("42".to_string()));
+    fn thread_scope_wraps_opaque_thread_keys() {
+        let scope = ThreadScope::new("thread-1");
 
-        assert_eq!(scope.thread_key().as_str(), "telegram:chat-1:topic:42");
+        assert_eq!(scope.thread_key().as_str(), "thread-1");
     }
 }

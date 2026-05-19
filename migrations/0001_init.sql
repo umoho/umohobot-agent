@@ -1,9 +1,6 @@
 CREATE TABLE threads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_key TEXT NOT NULL,
-    platform TEXT NOT NULL,
-    chat_id TEXT NOT NULL,
-    topic_id TEXT,
+    thread_key TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL CHECK (state IN ('active', 'draining', 'closed')),
     opened_at INTEGER NOT NULL,
     last_activity_at INTEGER NOT NULL,

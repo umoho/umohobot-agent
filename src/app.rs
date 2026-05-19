@@ -97,9 +97,10 @@ impl App {
 
     pub async fn prepare_turn(
         &self,
+        thread_scope: &ThreadScope,
         message: &PlatformMessage,
+        parent_thread_id: Option<i64>,
     ) -> Result<PreparedTurn, StorageError> {
-        let thread_scope = ThreadScope::from_platform_message(message);
         let mut notes = structured_message_notes(message);
 
         debug!(
@@ -117,7 +118,8 @@ impl App {
         let observation = self
             .storage
             .observe_message(InboundMessageRecord {
-                scope: thread_scope,
+                scope: thread_scope.clone(),
+                parent_thread_id,
                 platform_message_id: message.message_id.clone(),
                 sender_id: message.sender_id.clone(),
                 sender_name: None,
@@ -606,6 +608,10 @@ mod tests {
         }
     }
 
+    fn test_thread_scope() -> ThreadScope {
+        ThreadScope::new("thread-1")
+    }
+
     #[test]
     fn runtime_summary_reports_provider_and_platforms() {
         let config = Config {
@@ -685,8 +691,12 @@ mod tests {
     async fn app_turn_lifecycle_records_completed_turn() {
         let app = App::new(test_config(unique_data_dir("app-turn-completed")));
         let message = test_message();
+        let thread_scope = test_thread_scope();
 
-        let prepared = app.prepare_turn(&message).await.expect("prepare turn");
+        let prepared = app
+            .prepare_turn(&thread_scope, &message, None)
+            .await
+            .expect("prepare turn");
         assert_eq!(prepared.observation.thread.turn_count, 0);
 
         let started = app.start_turn(&prepared, None).await.expect("start turn");
@@ -695,7 +705,7 @@ mod tests {
 
         let active = app
             .storage
-            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .load_active_thread(&thread_scope)
             .await
             .expect("load active thread")
             .expect("active thread");
@@ -734,7 +744,7 @@ mod tests {
 
         let active_after = app
             .storage
-            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .load_active_thread(&thread_scope)
             .await
             .expect("load active thread after finish")
             .expect("active thread after finish");
@@ -746,8 +756,12 @@ mod tests {
     async fn app_turn_lifecycle_records_failed_turn() {
         let app = App::new(test_config(unique_data_dir("app-turn-failed")));
         let message = test_message();
+        let thread_scope = test_thread_scope();
 
-        let prepared = app.prepare_turn(&message).await.expect("prepare turn");
+        let prepared = app
+            .prepare_turn(&thread_scope, &message, None)
+            .await
+            .expect("prepare turn");
         let started = app.start_turn(&prepared, None).await.expect("start turn");
 
         let outcome = TurnOutcome {
@@ -779,7 +793,7 @@ mod tests {
 
         let active_after = app
             .storage
-            .load_active_thread(&ThreadScope::from_platform_message(&message))
+            .load_active_thread(&thread_scope)
             .await
             .expect("load active thread after finish")
             .expect("active thread after finish");
