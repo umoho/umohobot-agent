@@ -7,7 +7,6 @@ use crate::platforms::{PlatformKind, PlatformMessage};
 
 use super::event::EventRecord;
 
-#[path = "storage_thread_history.rs"]
 pub mod history;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

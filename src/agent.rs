@@ -21,7 +21,6 @@ use tracing::{debug, error, info, warn};
 
 const OPENROUTER_API_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
-#[path = "context.rs"]
 pub mod context;
 
 pub use context::{

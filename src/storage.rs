@@ -2,17 +2,11 @@ use std::{env, path::PathBuf};
 
 use thiserror::Error;
 
-#[path = "storage_event.rs"]
 pub mod event;
-#[path = "storage_sqlite.rs"]
 pub mod sqlite;
-#[path = "storage_summary.rs"]
 pub mod summary;
-#[path = "storage_thread.rs"]
 pub mod thread;
-#[path = "storage_turn.rs"]
 pub mod turn;
-#[path = "storage_usage.rs"]
 pub mod usage;
 
 pub use event::{EventKind, EventRecord, NewEvent};
