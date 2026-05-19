@@ -2,17 +2,16 @@ use crate::{
     agent::{AgentRequest, AgentRequestBuilder, AgentResponse, AgentRuntime, AgentRuntimeError},
     config::Config,
     logging::sanitize_for_log,
-    platforms::{PlatformMessage, Platforms, ReplyHandle, TelegramOutbox},
+    platforms::{PlatformMessage, Platforms, ReplyHandle},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
     storage::{
         EventRecord, InboundMessageRecord, MessageObservation, Storage, StorageError,
         SummaryRecord, ThreadRecord, ThreadScope, TurnFinish, TurnRecord, TurnStart, TurnStatus,
         UsageLedgerRecord, UsageScope,
     },
-    tools::{ChatBatchTool, HistoryQueryTool, ToolRegistry},
+    tools::{ToolBundle, ToolRegistry},
 };
 use chrono::{Duration, Utc};
-use rig::tool::server::ToolServer;
 use serde_json::json;
 use tracing::{debug, info, warn};
 
@@ -61,23 +60,18 @@ impl App {
     }
 
     pub fn try_new(config: Config) -> Result<Self, AgentRuntimeError> {
-        Self::try_new_with_telegram_outbox(config, TelegramOutbox::new())
+        Self::try_new_with_tool_bundle(config, ToolBundle::empty())
     }
 
-    pub fn try_new_with_telegram_outbox(
+    pub fn try_new_with_tool_bundle(
         config: Config,
-        telegram_outbox: TelegramOutbox,
+        tool_bundle: ToolBundle,
     ) -> Result<Self, AgentRuntimeError> {
         let storage = Storage::new(config.data_dir.clone());
         let policy = PolicyEngine::new();
-        let mut tools = ToolRegistry::new();
-        tools.register(ChatBatchTool::spec());
-        tools.register(HistoryQueryTool::spec());
-        let tool_server_handle = ToolServer::new()
-            .tool(ChatBatchTool::with_outbox(telegram_outbox))
-            .tool(HistoryQueryTool::with_storage(storage.clone()))
-            .run();
-        let agent = AgentRuntime::try_new_with_tool_server(&config, tool_server_handle)?;
+        let tools = tool_bundle.registry;
+        let agent =
+            AgentRuntime::try_new_with_tool_server(&config, tool_bundle.tool_server_handle)?;
         let prompt_builder = AgentRequestBuilder::from_config(&config);
         let platforms = Platforms::new();
 
@@ -502,7 +496,7 @@ fn platform_message_content(message: &PlatformMessage) -> serde_json::Value {
             .body_entities()
             .iter()
             .map(|entity| json!({
-                "kind": format!("{:?}", entity.kind.clone()),
+                "kind": entity.kind.as_str(),
                 "text": entity.text.as_str(),
             }))
             .collect::<Vec<_>>(),
