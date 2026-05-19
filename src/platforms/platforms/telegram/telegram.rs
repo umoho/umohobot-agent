@@ -4,19 +4,20 @@ use super::super::{
     AttachmentInfo, AttachmentKind, MessageBody, MessageEntityInfo, PlatformKind, PlatformMessage,
     PlatformMessageKind, ReplyHandle, ReplyMetadata,
 };
-use teloxide::types::{
-    Document, Message, MessageEntityKind, MessageEntityRef, PhotoSize, Sticker, Voice,
-};
+use super::outbox::TelegramOutbox;
+use teloxide::types::{ChatId, Document, Message, MessageEntityKind, PhotoSize, Sticker, Voice};
 
 #[derive(Clone, Debug)]
 pub struct TelegramRuntimeConfig {
     pub bot_name: String,
+    pub placeholder_text: String,
 }
 
 impl TelegramRuntimeConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             bot_name: config.bot_name.clone(),
+            placeholder_text: config.placeholder_text.clone(),
         }
     }
 }
@@ -24,6 +25,7 @@ impl TelegramRuntimeConfig {
 #[derive(Clone, Debug)]
 pub struct TelegramRuntime {
     config: TelegramRuntimeConfig,
+    outbox: TelegramOutbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +43,10 @@ pub struct TelegramInboundMessage {
 
 impl TelegramRuntime {
     pub fn new(config: TelegramRuntimeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            outbox: TelegramOutbox::new(),
+        }
     }
 
     pub fn from_config(config: &Config) -> Self {
@@ -50,6 +55,10 @@ impl TelegramRuntime {
 
     pub fn describe(&self) -> String {
         format!("telegram(bot={})", self.config.bot_name)
+    }
+
+    pub fn placeholder_text(&self) -> &str {
+        &self.config.placeholder_text
     }
 
     pub fn inbound_from_message(&self, message: &Message) -> TelegramInboundMessage {
@@ -73,12 +82,64 @@ impl TelegramRuntime {
         inbound.into()
     }
 
+    pub fn bind_bot(&self, bot: teloxide::Bot) {
+        self.outbox.bind_bot(bot);
+    }
+
+    pub fn outbox(&self) -> TelegramOutbox {
+        self.outbox.clone()
+    }
+
     pub fn reply_handle(&self, room_id: String, message_id: String) -> ReplyHandle {
         ReplyHandle {
             platform: PlatformKind::Telegram,
             room_id,
             message_id,
         }
+    }
+
+    pub async fn send_placeholder(
+        &self,
+        chat_id: ChatId,
+        thread_id: Option<&str>,
+    ) -> Result<ReplyHandle, teloxide::RequestError> {
+        self.outbox
+            .send_placeholder(chat_id, thread_id, self.placeholder_text())
+            .await
+    }
+
+    pub async fn send_text(
+        &self,
+        chat_id: ChatId,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> Result<ReplyHandle, teloxide::RequestError> {
+        self.outbox.send_text(chat_id, thread_id, text).await
+    }
+
+    pub async fn edit_text(
+        &self,
+        chat_id: ChatId,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), teloxide::RequestError> {
+        self.outbox.edit_text(chat_id, message_id, text).await
+    }
+
+    pub async fn delete_message(
+        &self,
+        chat_id: ChatId,
+        message_id: &str,
+    ) -> Result<(), teloxide::RequestError> {
+        self.outbox.delete_message(chat_id, message_id).await
+    }
+
+    pub async fn send_typing(
+        &self,
+        chat_id: ChatId,
+        thread_id: Option<&str>,
+    ) -> Result<(), teloxide::RequestError> {
+        self.outbox.send_typing(chat_id, thread_id).await
     }
 }
 
@@ -159,7 +220,9 @@ fn body_from_message(message: &Message) -> MessageBody {
     }
 }
 
-fn parsed_entities(entities: Option<Vec<MessageEntityRef<'_>>>) -> Vec<MessageEntityInfo> {
+fn parsed_entities(
+    entities: Option<Vec<teloxide::types::MessageEntityRef<'_>>>,
+) -> Vec<MessageEntityInfo> {
     entities
         .unwrap_or_default()
         .into_iter()
@@ -342,6 +405,7 @@ mod tests {
     fn describe_reports_bot_name() {
         let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
             bot_name: "bot".to_string(),
+            placeholder_text: "正在处理...".to_string(),
         });
 
         assert_eq!(runtime.describe(), "telegram(bot=bot)");
@@ -351,6 +415,7 @@ mod tests {
     fn reply_handle_uses_telegram_kind() {
         let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
             bot_name: "bot".to_string(),
+            placeholder_text: "正在处理...".to_string(),
         });
 
         let handle = runtime.reply_handle("room".to_string(), "msg".to_string());
@@ -364,6 +429,7 @@ mod tests {
     fn normalize_inbound_preserves_message_structure() {
         let runtime = TelegramRuntime::new(TelegramRuntimeConfig {
             bot_name: "bot".to_string(),
+            placeholder_text: "正在处理...".to_string(),
         });
         let inbound = TelegramInboundMessage {
             room_id: "room".to_string(),

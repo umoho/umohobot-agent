@@ -346,4 +346,7 @@ impl PlatformHub {
 
 pub mod telegram;
 
-pub use telegram::{TelegramInboundMessage, TelegramRuntime, TelegramRuntimeConfig};
+pub use telegram::{
+    TelegramInboundMessage, TelegramOutbox, TelegramOutboxError, TelegramRuntime,
+    TelegramRuntimeConfig,
+};

@@ -4,12 +4,10 @@ use crate::{
     agent::AgentRuntimeError,
     app::{App, TurnOutcome},
     config::{Config, RuntimeMode},
-    platforms::{Platforms, TelegramRuntime},
+    platforms::{Platforms, ReplyHandle, TelegramRuntime},
     storage::TurnStatus,
 };
-use teloxide::payloads::SendMessageSetters;
-use teloxide::prelude::Requester;
-use teloxide::types::{ChatId, MessageId, ThreadId};
+use teloxide::types::ChatId;
 use tracing::{debug, error, info, warn};
 
 #[derive(Clone, Debug)]
@@ -57,7 +55,6 @@ impl RuntimeController {
 
     async fn handle_telegram_message(
         &self,
-        bot: &teloxide::Bot,
         msg: &teloxide::types::Message,
     ) -> Result<(), teloxide::RequestError> {
         if msg.from.as_ref().map(|user| user.is_bot).unwrap_or(false) {
@@ -86,6 +83,29 @@ impl RuntimeController {
             "received telegram message"
         );
 
+        let placeholder_message = match self.telegram.send_placeholder(msg.chat.id, thread_id).await
+        {
+            Ok(message) => Some(message),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    chat_id = %msg.chat.id,
+                    thread_id = %thread_id.unwrap_or("none"),
+                    "failed to send telegram placeholder"
+                );
+                None
+            }
+        };
+
+        if let Err(err) = self.telegram.send_typing(msg.chat.id, thread_id).await {
+            warn!(
+                error = %err,
+                chat_id = %msg.chat.id,
+                thread_id = %thread_id.unwrap_or("none"),
+                "failed to send telegram typing indicator"
+            );
+        }
+
         let prepared = match self.app.prepare_turn(&platform_message).await {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -98,13 +118,17 @@ impl RuntimeController {
                     "failed to prepare turn"
                 );
                 let error_text = format!("系统暂时无法记录这条消息：{err}");
-                self.send_final_message(bot, msg.chat.id, thread_id, &error_text)
-                    .await?;
+                self.report_turn_error(msg.chat.id, placeholder_message.as_ref(), &error_text)
+                    .await;
                 return Ok(());
             }
         };
 
-        let started = match self.app.start_turn(&prepared).await {
+        let started = match self
+            .app
+            .start_turn(&prepared, placeholder_message.clone())
+            .await
+        {
             Ok(started) => started,
             Err(err) => {
                 error!(
@@ -114,24 +138,16 @@ impl RuntimeController {
                     "failed to start turn"
                 );
                 let error_text = format!("系统暂时无法开始处理：{err}");
-                self.send_final_message(bot, msg.chat.id, thread_id, &error_text)
-                    .await?;
+                self.report_turn_error(msg.chat.id, placeholder_message.as_ref(), &error_text)
+                    .await;
                 return Ok(());
             }
         };
 
         let outcome = self.app.respond_turn(&started).await;
-        let delivery_result = self
-            .send_final_message(bot, msg.chat.id, thread_id, &outcome.final_text)
-            .await;
-        let (final_message_id, delivery_error) = match delivery_result {
-            Ok(final_message_id) => (Some(final_message_id), None),
-            Err(err) => (None, Some(err)),
-        };
-
-        let final_status = Self::resolve_final_turn_status(&outcome, delivery_error.is_some());
-        let final_error_code =
-            Self::resolve_final_turn_error_code(&outcome, delivery_error.is_some());
+        let final_message = outcome.final_message.clone();
+        let final_status = Self::resolve_final_turn_status(&outcome);
+        let final_error_code = Self::resolve_final_turn_error_code(&outcome);
 
         if let Err(err) = self
             .app
@@ -139,7 +155,7 @@ impl RuntimeController {
                 &started,
                 &outcome,
                 final_status,
-                final_message_id,
+                final_message,
                 final_error_code,
             )
             .await
@@ -147,69 +163,48 @@ impl RuntimeController {
             return Err(self.storage_error_to_request_error(err));
         }
 
-        if let Some(err) = delivery_error {
-            return Err(err);
-        }
-
         Ok(())
     }
 
-    async fn send_final_message(
+    async fn report_turn_error(
         &self,
-        bot: &teloxide::Bot,
         chat_id: ChatId,
-        thread_id: Option<&str>,
-        final_text: &str,
-    ) -> Result<String, teloxide::RequestError> {
-        let mut send_request = bot.send_message(chat_id, final_text.to_string());
-        if let Some(thread_id) = parse_thread_id(thread_id) {
-            send_request = send_request.message_thread_id(thread_id);
-        }
-        match send_request.await {
-            Ok(message) => {
-                info!(
-                    chat_id = %chat_id,
-                    final_message_id = %message.id,
-                    "final message sent"
-                );
-                Ok(message.id.to_string())
-            }
-            Err(err) => {
-                error!(
+        existing_message: Option<&ReplyHandle>,
+        error_text: &str,
+    ) {
+        if let Some(existing_message) = existing_message {
+            if let Err(err) = self
+                .telegram
+                .edit_text(chat_id, existing_message.message_id.as_str(), error_text)
+                .await
+            {
+                warn!(
                     error = %err,
                     chat_id = %chat_id,
-                    "failed to send final message"
+                    message_id = %existing_message.message_id,
+                    "failed to edit telegram placeholder with error"
                 );
-                Err(err)
             }
+            return;
         }
+
+        warn!(
+            chat_id = %chat_id,
+            error_text = %error_text,
+            "telegram placeholder unavailable for error reporting"
+        );
     }
 
-    fn resolve_final_turn_status(outcome: &TurnOutcome, delivery_failed: bool) -> TurnStatus {
-        if matches!(outcome.status, TurnStatus::Failed) || delivery_failed {
+    fn resolve_final_turn_status(outcome: &TurnOutcome) -> TurnStatus {
+        if matches!(outcome.status, TurnStatus::Failed) {
             TurnStatus::Failed
         } else {
             TurnStatus::Completed
         }
     }
 
-    fn resolve_final_turn_error_code(
-        outcome: &TurnOutcome,
-        delivery_failed: bool,
-    ) -> Option<String> {
-        if matches!(outcome.status, TurnStatus::Failed) {
-            outcome.error_code.clone().or_else(|| {
-                if delivery_failed {
-                    Some("telegram_delivery_failed".to_string())
-                } else {
-                    None
-                }
-            })
-        } else if delivery_failed {
-            Some("telegram_delivery_failed".to_string())
-        } else {
-            None
-        }
+    fn resolve_final_turn_error_code(outcome: &TurnOutcome) -> Option<String> {
+        outcome.error_code.clone()
     }
 
     fn storage_error_to_request_error(
@@ -239,14 +234,15 @@ impl RuntimeController {
             "runtime starting"
         );
         let bot = teloxide::Bot::new(token);
+        self.telegram.bind_bot(bot.clone());
         let runtime = self.clone();
 
         teloxide::repl(
             bot,
-            move |bot: teloxide::Bot, msg: teloxide::types::Message| {
+            move |_bot: teloxide::Bot, msg: teloxide::types::Message| {
                 let runtime = runtime.clone();
 
-                async move { runtime.handle_telegram_message(&bot, &msg).await }
+                async move { runtime.handle_telegram_message(&msg).await }
             },
         )
         .await;
@@ -272,16 +268,6 @@ pub async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-fn parse_thread_id(value: Option<&str>) -> Option<ThreadId> {
-    value.and_then(|value| match value.parse::<i32>() {
-        Ok(id) => Some(ThreadId(MessageId(id))),
-        Err(err) => {
-            warn!(thread_id = %value, error = %err, "failed to parse telegram thread id");
-            None
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +279,9 @@ mod tests {
             bot_name: "bot".to_string(),
             runtime_mode: RuntimeMode::Telegram,
             telegram_bot_token: None,
+            placeholder_text: "正在处理...".to_string(),
+            message_edit_throttle_ms: 750,
+            tool_loop_max_turns: 3,
             default_provider: ProviderConfig {
                 kind: ProviderKind::Ollama,
                 base_url: None,

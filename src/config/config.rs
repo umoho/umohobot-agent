@@ -40,6 +40,9 @@ pub struct Config {
     pub bot_name: String,
     pub runtime_mode: RuntimeMode,
     pub telegram_bot_token: Option<String>,
+    pub placeholder_text: String,
+    pub message_edit_throttle_ms: u64,
+    pub tool_loop_max_turns: usize,
     pub default_provider: ProviderConfig,
     pub allow_user_provider: bool,
     pub max_response_chars: usize,
@@ -125,6 +128,9 @@ struct FileConfig {
 struct AppFileConfig {
     bot_name: Option<String>,
     runtime_mode: Option<RuntimeMode>,
+    placeholder_text: Option<String>,
+    message_edit_throttle_ms: Option<u64>,
+    tool_loop_max_turns: Option<usize>,
     allow_user_provider: Option<bool>,
     max_response_chars: Option<usize>,
 }
@@ -175,6 +181,17 @@ impl Config {
             .unwrap_or(RuntimeMode::Telegram);
         let telegram_bot_token =
             env_string("TELEGRAM_BOT_TOKEN").or_else(|| env_string("TELOXIDE_TOKEN"));
+        let placeholder_text = env_string("PLACEHOLDER_TEXT")
+            .or(file.app.placeholder_text)
+            .unwrap_or_else(|| "正在处理...".to_string());
+        let message_edit_throttle_ms = env_usize("MESSAGE_EDIT_THROTTLE_MS")
+            .map(|value| value as u64)
+            .or(file.app.message_edit_throttle_ms)
+            .unwrap_or(750);
+        let tool_loop_max_turns = env_usize("TOOL_LOOP_MAX_TURNS")
+            .or(file.app.tool_loop_max_turns)
+            .unwrap_or(3)
+            .max(1);
         let allow_user_provider = env_bool("ALLOW_USER_PROVIDER")
             .or(file.app.allow_user_provider)
             .unwrap_or(false);
@@ -278,6 +295,9 @@ impl Config {
             bot_name,
             runtime_mode,
             telegram_bot_token,
+            placeholder_text,
+            message_edit_throttle_ms,
+            tool_loop_max_turns,
             default_provider: ProviderConfig {
                 kind: provider_kind.expect("validated above"),
                 base_url: provider_base_url,

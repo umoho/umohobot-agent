@@ -2,7 +2,7 @@ use crate::{
     agent::{AgentRequest, AgentRequestBuilder, AgentResponse, AgentRuntime, AgentRuntimeError},
     config::Config,
     logging::sanitize_for_log,
-    platforms::{PlatformMessage, Platforms},
+    platforms::{PlatformMessage, Platforms, ReplyHandle},
     policy::{PolicyDecision, PolicyEngine, QuotaSnapshot},
     storage::{
         EventRecord, InboundMessageRecord, MessageObservation, Storage, StorageError,
@@ -27,11 +27,13 @@ pub struct PreparedTurn {
 pub struct StartedTurn {
     pub prepared: PreparedTurn,
     pub turn: TurnRecord,
+    pub placeholder_message: Option<ReplyHandle>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TurnOutcome {
     pub final_text: String,
+    pub final_message: Option<ReplyHandle>,
     pub notes: Vec<String>,
     pub status: TurnStatus,
     pub error_code: Option<String>,
@@ -227,7 +229,11 @@ impl App {
         })
     }
 
-    pub async fn start_turn(&self, prepared: &PreparedTurn) -> Result<StartedTurn, StorageError> {
+    pub async fn start_turn(
+        &self,
+        prepared: &PreparedTurn,
+        placeholder_message: Option<ReplyHandle>,
+    ) -> Result<StartedTurn, StorageError> {
         let lease_until =
             Some(Utc::now() + Duration::seconds(self.config.prompt.turn_lease_secs as i64));
         let turn = self
@@ -244,18 +250,32 @@ impl App {
             })
             .await?;
 
+        let turn = if let Some(placeholder_message) = placeholder_message.as_ref() {
+            self.storage
+                .set_turn_placeholder_message(turn.id, Some(placeholder_message.message_id.clone()))
+                .await?
+        } else {
+            turn
+        };
+
         Ok(StartedTurn {
             prepared: prepared.clone(),
             turn,
+            placeholder_message,
         })
     }
 
     pub async fn respond_turn(&self, started: &StartedTurn) -> TurnOutcome {
         let AgentResponse {
             final_text: agent_text,
+            final_message: agent_final_message,
             notes: mut agent_notes,
             status: agent_status,
             error_code: agent_error_code,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+            estimated_usage,
         } = self
             .agent
             .respond(&started.prepared.request, &self.tools)
@@ -307,10 +327,10 @@ impl App {
                 ),
                 provider,
                 turn_id: Some(started.turn.id),
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                tool_calls: 0,
-                estimated: true,
+                prompt_tokens,
+                completion_tokens,
+                tool_calls,
+                estimated: estimated_usage,
                 created_at: None,
             })
             .await
@@ -336,6 +356,7 @@ impl App {
             PolicyDecision::Allow => agent_text,
             PolicyDecision::Deny { reason } | PolicyDecision::NeedConfirmation { reason } => reason,
         };
+        let final_message = agent_final_message.or_else(|| started.placeholder_message.clone());
 
         debug!(
             thread_key = %started.prepared.observation.thread.thread_key(),
@@ -346,13 +367,14 @@ impl App {
 
         TurnOutcome {
             final_text,
+            final_message,
             notes,
             status: agent_status,
             error_code: agent_error_code,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
-            estimated_usage: true,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+            estimated_usage,
         }
     }
 
@@ -361,14 +383,14 @@ impl App {
         started: &StartedTurn,
         outcome: &TurnOutcome,
         status: TurnStatus,
-        final_message_id: Option<String>,
+        final_message: Option<ReplyHandle>,
         error_code: Option<String>,
     ) -> Result<TurnRecord, StorageError> {
         self.storage
             .finish_turn(TurnFinish {
                 turn_id: started.turn.id,
                 status,
-                final_message_id,
+                final_message_id: final_message.map(|message| message.message_id),
                 prompt_tokens: outcome.prompt_tokens,
                 completion_tokens: outcome.completion_tokens,
                 tool_calls: outcome.tool_calls,
@@ -538,6 +560,9 @@ mod tests {
             bot_name: "bot".to_string(),
             runtime_mode: RuntimeMode::Local,
             telegram_bot_token: None,
+            placeholder_text: "正在处理...".to_string(),
+            message_edit_throttle_ms: 750,
+            tool_loop_max_turns: 3,
             default_provider: ProviderConfig {
                 kind: ProviderKind::Ollama,
                 base_url: Some("http://127.0.0.1:11434".to_string()),
@@ -575,6 +600,9 @@ mod tests {
             bot_name: "bot".to_string(),
             runtime_mode: RuntimeMode::Telegram,
             telegram_bot_token: None,
+            placeholder_text: "正在处理...".to_string(),
+            message_edit_throttle_ms: 750,
+            tool_loop_max_turns: 3,
             default_provider: ProviderConfig {
                 kind: ProviderKind::Ollama,
                 base_url: None,
@@ -649,8 +677,9 @@ mod tests {
         let prepared = app.prepare_turn(&message).await.expect("prepare turn");
         assert_eq!(prepared.observation.thread.turn_count, 0);
 
-        let started = app.start_turn(&prepared).await.expect("start turn");
+        let started = app.start_turn(&prepared, None).await.expect("start turn");
         assert_eq!(started.turn.status, TurnStatus::Running);
+        assert!(started.placeholder_message.is_none());
 
         let active = app
             .storage
@@ -663,6 +692,7 @@ mod tests {
 
         let outcome = TurnOutcome {
             final_text: "done".to_string(),
+            final_message: None,
             notes: vec![],
             status: TurnStatus::Completed,
             error_code: None,
@@ -677,7 +707,11 @@ mod tests {
                 &started,
                 &outcome,
                 TurnStatus::Completed,
-                Some("message-1".to_string()),
+                Some(crate::platforms::ReplyHandle {
+                    platform: PlatformKind::Telegram,
+                    room_id: "room".to_string(),
+                    message_id: "message-1".to_string(),
+                }),
                 None,
             )
             .await
@@ -702,10 +736,11 @@ mod tests {
         let message = test_message();
 
         let prepared = app.prepare_turn(&message).await.expect("prepare turn");
-        let started = app.start_turn(&prepared).await.expect("start turn");
+        let started = app.start_turn(&prepared, None).await.expect("start turn");
 
         let outcome = TurnOutcome {
             final_text: "rig 请求失败：boom".to_string(),
+            final_message: None,
             notes: vec![],
             status: TurnStatus::Failed,
             error_code: Some("provider_error".to_string()),

@@ -15,7 +15,10 @@ use super::super::{
     StorageError,
     event::{EventKind, EventRecord, NewEvent},
     summary::{SummaryRecord, SummaryWrite},
-    thread::{InboundMessageRecord, MessageObservation, ThreadRecord, ThreadScope, ThreadState},
+    thread::{
+        InboundMessageRecord, MessageObservation, ThreadHistorySliceRecord, ThreadRecord,
+        ThreadScope, ThreadState,
+    },
     turn::{TurnFinish, TurnRecord, TurnStart, TurnStatus},
     usage::{UsageLedgerRecord, UsageScope, UsageScopeKind, UsageTotalsRecord},
 };
@@ -366,6 +369,49 @@ impl SqliteStorage {
         turn_row.into_record()
     }
 
+    pub async fn set_turn_placeholder_message(
+        &self,
+        turn_id: i64,
+        placeholder_message_id: Option<String>,
+    ) -> Result<TurnRecord, StorageError> {
+        self.ensure_ready().await?;
+
+        let pool = self.pool().await?;
+        let mut tx = pool.begin().await?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE turns
+            SET placeholder_message_id = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(placeholder_message_id)
+        .bind(turn_id)
+        .execute(tx.as_mut())
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            warn!(
+                turn_id = turn_id,
+                "failed to update turn placeholder message because turn does not exist"
+            );
+            return Err(StorageError::InvalidValue {
+                kind: "turn_id",
+                value: turn_id.to_string(),
+            });
+        }
+
+        let turn_row = self.load_turn_row_tx(&mut tx, turn_id).await?;
+        tx.commit().await?;
+        info!(
+            turn_id = turn_row.id,
+            placeholder_message_id = %turn_row.placeholder_message_id.as_deref().unwrap_or("none"),
+            "turn placeholder message updated"
+        );
+
+        turn_row.into_record()
+    }
+
     pub async fn append_summary(
         &self,
         summary: SummaryWrite,
@@ -682,6 +728,89 @@ impl SqliteStorage {
             "loaded recent visible events"
         );
         Ok(events)
+    }
+
+    pub async fn load_thread_history_slice(
+        &self,
+        scope: &ThreadScope,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+        limit: i64,
+    ) -> Result<Option<ThreadHistorySliceRecord>, StorageError> {
+        self.ensure_ready().await?;
+
+        let pool = self.pool().await?;
+        let mut conn = pool.acquire().await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        let thread_key = scope.thread_key();
+        let thread_row = self
+            .load_latest_thread_row_tx(&mut tx, thread_key.as_str())
+            .await?;
+        let Some(thread_row) = thread_row else {
+            debug!(
+                thread_key = %thread_key,
+                found = false,
+                "loaded thread history slice"
+            );
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let events = if limit <= 0 {
+            Vec::new()
+        } else {
+            let mut rows = sqlx::query_as::<_, EventRow>(
+                r#"
+                SELECT
+                    id,
+                    thread_id,
+                    seq,
+                    turn_id,
+                    kind,
+                    sender_id,
+                    sender_name,
+                    platform_message_id,
+                    reply_to_platform_message_id,
+                    content_json,
+                    visible_to_model,
+                    created_at
+                FROM events
+                WHERE thread_id = ?
+                  AND seq > ?
+                  AND seq < ?
+                ORDER BY seq DESC, id DESC
+                LIMIT ?
+                "#,
+            )
+            .bind(thread_row.id)
+            .bind(after_seq_exclusive)
+            .bind(before_seq_exclusive)
+            .bind(limit)
+            .fetch_all(tx.as_mut())
+            .await?;
+            rows.reverse();
+            rows.into_iter()
+                .map(EventRow::into_record)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let event_count = events.len();
+        let thread_id = thread_row.id;
+        let history = ThreadHistorySliceRecord {
+            thread: thread_row.into_record()?,
+            events,
+        };
+        tx.commit().await?;
+        debug!(
+            thread_id = thread_id,
+            thread_key = %thread_key,
+            after_seq_exclusive = after_seq_exclusive,
+            before_seq_exclusive = before_seq_exclusive,
+            limit = limit,
+            event_count = event_count,
+            "loaded thread history slice"
+        );
+        Ok(Some(history))
     }
 
     pub async fn load_thread(&self, thread_id: i64) -> Result<Option<ThreadRecord>, StorageError> {
@@ -1243,6 +1372,7 @@ impl SqliteStorage {
                 model,
                 prompt_version,
                 context_hash,
+                placeholder_message_id,
                 final_message_id,
                 prompt_tokens,
                 completion_tokens,
@@ -1417,6 +1547,7 @@ struct TurnRow {
     model: String,
     prompt_version: i64,
     context_hash: Option<String>,
+    placeholder_message_id: Option<String>,
     final_message_id: Option<String>,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -1445,6 +1576,7 @@ impl TurnRow {
             model: self.model,
             prompt_version: self.prompt_version,
             context_hash: self.context_hash,
+            placeholder_message_id: self.placeholder_message_id,
             final_message_id: self.final_message_id,
             prompt_tokens: i64_to_u64(self.prompt_tokens)?,
             completion_tokens: i64_to_u64(self.completion_tokens)?,
@@ -1650,6 +1782,16 @@ mod tests {
         assert_eq!(turn.trigger_event_id, observation.event.id);
         assert_eq!(turn.status, TurnStatus::Running);
         assert_eq!(turn.lease_until, Some(turn_lease_until));
+        assert!(turn.placeholder_message_id.is_none());
+
+        let placeholder_turn = storage
+            .set_turn_placeholder_message(turn.id, Some("placeholder-1".to_string()))
+            .await
+            .expect("set placeholder message");
+        assert_eq!(
+            placeholder_turn.placeholder_message_id.as_deref(),
+            Some("placeholder-1")
+        );
 
         let assistant_event = storage
             .append_event(NewEvent {
@@ -1709,7 +1851,7 @@ mod tests {
             .finish_turn(TurnFinish {
                 turn_id: turn.id,
                 status: TurnStatus::Completed,
-                final_message_id: Some("placeholder-1".to_string()),
+                final_message_id: Some("final-1".to_string()),
                 prompt_tokens: 12,
                 completion_tokens: 34,
                 tool_calls: 2,
@@ -1721,6 +1863,11 @@ mod tests {
             .expect("finish turn");
 
         assert_eq!(finished.status, TurnStatus::Completed);
+        assert_eq!(
+            finished.placeholder_message_id.as_deref(),
+            Some("placeholder-1")
+        );
+        assert_eq!(finished.final_message_id.as_deref(), Some("final-1"));
         assert_eq!(finished.prompt_tokens, 12);
         assert_eq!(finished.completion_tokens, 34);
         assert_eq!(finished.tool_calls, 2);
@@ -1807,6 +1954,28 @@ mod tests {
         assert_eq!(recent_events[0].id, assistant_event.id);
         assert_eq!(recent_events[1].id, final_event.id);
         assert_ne!(hidden_event.id, recent_events[0].id);
+
+        let history_slice = storage
+            .load_thread_history_slice(&scope, 1, 5, 3)
+            .await
+            .expect("load thread history slice")
+            .expect("history slice should exist");
+
+        assert_eq!(history_slice.thread.id, observation.thread.id);
+        assert_eq!(
+            history_slice.thread.thread_key().as_str(),
+            scope.thread_key().as_str()
+        );
+        assert_eq!(
+            history_slice
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(history_slice.events.len(), 3);
+        assert_eq!(history_slice.events[1].id, hidden_event.id);
 
         let active = storage
             .load_active_thread(&scope)
@@ -1995,7 +2164,7 @@ mod tests {
             .finish_turn(TurnFinish {
                 turn_id: turn.id,
                 status: TurnStatus::Completed,
-                final_message_id: Some("placeholder-1".to_string()),
+                final_message_id: Some("final-1".to_string()),
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 tool_calls: 0,
@@ -2007,6 +2176,8 @@ mod tests {
             .expect("finish turn");
 
         assert!(finished.lease_until.is_none());
+        assert!(finished.placeholder_message_id.is_none());
+        assert_eq!(finished.final_message_id.as_deref(), Some("final-1"));
 
         let thread_after_finish = storage
             .load_thread(observation.thread.id)
@@ -2027,6 +2198,52 @@ mod tests {
         .await
         .expect("load turn lease after finish");
         assert!(turn_lease_after_finish.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_placeholder_message_can_be_updated_independently() {
+        let storage = SqliteStorage::new(unique_database_path("turn-placeholder"));
+        let scope = ThreadScope::new(PlatformKind::Telegram, "chat-placeholder", None);
+        let thread_lease_until = lease_after_secs(300);
+
+        let observation = storage
+            .observe_message(inbound_message(
+                scope.clone(),
+                "msg-1".to_string(),
+                "user-1".to_string(),
+                Some("Alice".to_string()),
+                "hello".to_string(),
+                Some(thread_lease_until),
+            ))
+            .await
+            .expect("observe message");
+
+        let turn = storage
+            .start_turn(TurnStart {
+                thread_id: observation.thread.id,
+                trigger_event_id: observation.event.id,
+                provider: "ollama".to_string(),
+                model: "llama3.1".to_string(),
+                prompt_version: 1,
+                context_hash: None,
+                lease_until: None,
+                started_at: None,
+            })
+            .await
+            .expect("start turn");
+
+        assert!(turn.placeholder_message_id.is_none());
+
+        let updated_turn = storage
+            .set_turn_placeholder_message(turn.id, Some("placeholder-42".to_string()))
+            .await
+            .expect("update placeholder");
+
+        assert_eq!(
+            updated_turn.placeholder_message_id.as_deref(),
+            Some("placeholder-42")
+        );
+        assert!(updated_turn.final_message_id.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

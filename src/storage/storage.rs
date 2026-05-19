@@ -13,7 +13,8 @@ pub use event::{EventKind, EventRecord, NewEvent};
 pub use sqlite::SqliteStorage;
 pub use summary::{SummaryRecord, SummaryWrite};
 pub use thread::{
-    InboundMessageRecord, MessageObservation, ThreadKey, ThreadRecord, ThreadScope, ThreadState,
+    InboundMessageRecord, MessageObservation, ThreadHistorySliceRecord, ThreadKey, ThreadRecord,
+    ThreadScope, ThreadState,
 };
 pub use turn::{TurnFinish, TurnRecord, TurnStart, TurnStatus};
 pub use usage::{UsageLedgerRecord, UsageScope, UsageScopeKind, UsageTotalsRecord};
@@ -100,6 +101,16 @@ impl Storage {
         self.backend.finish_turn(turn).await
     }
 
+    pub async fn set_turn_placeholder_message(
+        &self,
+        turn_id: i64,
+        placeholder_message_id: Option<String>,
+    ) -> Result<TurnRecord, StorageError> {
+        self.backend
+            .set_turn_placeholder_message(turn_id, placeholder_message_id)
+            .await
+    }
+
     pub async fn append_summary(
         &self,
         summary: SummaryWrite,
@@ -132,6 +143,18 @@ impl Storage {
     ) -> Result<Vec<EventRecord>, StorageError> {
         self.backend
             .load_recent_visible_events(thread_id, after_seq_exclusive, before_seq_exclusive)
+            .await
+    }
+
+    pub async fn load_thread_history_slice(
+        &self,
+        scope: &ThreadScope,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+        limit: i64,
+    ) -> Result<Option<ThreadHistorySliceRecord>, StorageError> {
+        self.backend
+            .load_thread_history_slice(scope, after_seq_exclusive, before_seq_exclusive, limit)
             .await
     }
 
@@ -215,6 +238,20 @@ impl StorageBackend {
         }
     }
 
+    async fn set_turn_placeholder_message(
+        &self,
+        turn_id: i64,
+        placeholder_message_id: Option<String>,
+    ) -> Result<TurnRecord, StorageError> {
+        match self {
+            Self::Sqlite(storage) => {
+                storage
+                    .set_turn_placeholder_message(turn_id, placeholder_message_id)
+                    .await
+            }
+        }
+    }
+
     async fn append_summary(&self, summary: SummaryWrite) -> Result<SummaryRecord, StorageError> {
         match self {
             Self::Sqlite(storage) => storage.append_summary(summary).await,
@@ -257,6 +294,27 @@ impl StorageBackend {
                         thread_id,
                         after_seq_exclusive,
                         before_seq_exclusive,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn load_thread_history_slice(
+        &self,
+        scope: &ThreadScope,
+        after_seq_exclusive: i64,
+        before_seq_exclusive: i64,
+        limit: i64,
+    ) -> Result<Option<ThreadHistorySliceRecord>, StorageError> {
+        match self {
+            Self::Sqlite(storage) => {
+                storage
+                    .load_thread_history_slice(
+                        scope,
+                        after_seq_exclusive,
+                        before_seq_exclusive,
+                        limit,
                     )
                     .await
             }
