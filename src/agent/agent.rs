@@ -195,7 +195,6 @@ impl AgentRuntime {
             model = %self.model,
             input_chars = prompt_text.chars().count(),
             history_messages = request.chat_history.len(),
-            preamble_chars = request.preamble.chars().count(),
             tool_count = tools.count(),
             tool_loop_max_turns = self.tool_loop_max_turns,
             "agent request started"
@@ -293,7 +292,6 @@ impl AgentRuntime {
                 .completion(prompt.clone(), history)
                 .await
                 .map_err(|err| err.to_string())?
-                .preamble(request.preamble.clone())
                 .additional_params_opt(request.additional_params.clone());
 
             let response = completion_request
@@ -488,7 +486,6 @@ impl AgentRuntime {
             ),
             format!("prompt_summary_present={}", request.summary_present),
             format!("prompt_history_messages={}", request.chat_history.len()),
-            format!("prompt_preamble_chars={}", request.preamble.chars().count()),
             format!("prompt_text_chars={}", prompt_text.chars().count()),
             format!("prompt_tool_count={}", request.tool_count),
             format!("thread_id={}", request.thread_id),
@@ -825,7 +822,6 @@ mod tests {
             thread_key: "telegram:room".to_string(),
             thread_state: "active".to_string(),
             summary_present: false,
-            preamble: String::new(),
             prompt: rig::message::Message::user(prompt_text),
             chat_history: vec![],
             additional_params: None,
@@ -834,7 +830,6 @@ mod tests {
             trimmed_recent_event_count: 0,
             trimmed_summary_chars: 0,
             trimmed_current_turn_chars: 0,
-            trimmed_preamble_chars: 0,
             tool_count: 0,
         }
     }

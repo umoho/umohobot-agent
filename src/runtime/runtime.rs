@@ -32,9 +32,9 @@ impl RuntimeController {
     }
 
     pub fn try_new(config: Config) -> Result<Self, AgentRuntimeError> {
-        let app = App::try_new(config.clone())?;
-        let platforms = Platforms::new();
         let telegram = TelegramRuntime::from_config(&config);
+        let app = App::try_new_with_telegram_outbox(config.clone(), telegram.outbox())?;
+        let platforms = Platforms::new();
 
         Ok(Self {
             config,

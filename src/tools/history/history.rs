@@ -8,6 +8,7 @@ use crate::{
         HistoryDirection, HistoryItem, HistoryQueryRequest, HistoryQueryResult, HistoryWindow,
         MessageRef, ToolContext, ToolIssue, history_query_request_schema,
     },
+    tools::{ToolKind, ToolRisk, ToolSpec},
 };
 
 #[derive(Clone, Debug)]
@@ -36,6 +37,15 @@ impl HistoryQueryTool {
 
     pub fn with_storage(storage: Storage) -> Self {
         Self { storage }
+    }
+
+    pub fn spec() -> ToolSpec {
+        ToolSpec {
+            kind: ToolKind::Custom("storage".to_string()),
+            name: Self::NAME.to_string(),
+            description: "Query a bounded history window for the current thread. The tool is host-side and returns model-friendly, structured history items.".to_string(),
+            risk: ToolRisk::Medium,
+        }
     }
 }
 

@@ -1,9 +1,11 @@
 use std::sync::{Arc, RwLock};
 
 use crate::platforms::{PlatformKind, ReplyHandle};
-use teloxide::payloads::{SendChatActionSetters, SendMessageSetters};
+use teloxide::payloads::{EditMessageTextSetters, SendChatActionSetters, SendMessageSetters};
 use teloxide::prelude::Requester;
-use teloxide::types::{ChatAction, ChatId, MessageId, ThreadId};
+use teloxide::types::{
+    ChatAction, ChatId, LinkPreviewOptions, MessageId, ParseMode, ReplyParameters, ThreadId,
+};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -21,6 +23,13 @@ pub enum TelegramOutboxError {
 impl TelegramOutbox {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.bot
+            .read()
+            .expect("telegram outbox lock should not be poisoned")
+            .is_some()
     }
 
     pub fn bind_bot(&self, bot: teloxide::Bot) {
@@ -69,10 +78,42 @@ impl TelegramOutbox {
         thread_id: Option<&str>,
         text: &str,
     ) -> Result<ReplyHandle, teloxide::RequestError> {
+        self.send_draft(chat_id, thread_id, text, None, false, false, None)
+            .await
+    }
+
+    pub async fn send_draft(
+        &self,
+        chat_id: ChatId,
+        thread_id: Option<&str>,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        disable_web_page_preview: bool,
+        silent: bool,
+        reply_to_message_id: Option<&str>,
+    ) -> Result<ReplyHandle, teloxide::RequestError> {
         let bot = self.bot()?;
         let mut request = bot.send_message(chat_id, text.to_string());
         if let Some(thread_id) = parse_thread_id(thread_id) {
             request = request.message_thread_id(thread_id);
+        }
+        if let Some(parse_mode) = parse_mode {
+            request = request.parse_mode(parse_mode);
+        }
+        if disable_web_page_preview {
+            request = request.link_preview_options(LinkPreviewOptions {
+                is_disabled: true,
+                url: None,
+                prefer_small_media: false,
+                prefer_large_media: false,
+                show_above_text: false,
+            });
+        }
+        if silent {
+            request = request.disable_notification(true);
+        }
+        if let Some(reply_to_message_id) = reply_to_message_id.and_then(parse_message_id) {
+            request = request.reply_parameters(ReplyParameters::new(reply_to_message_id));
         }
 
         match request.await {
@@ -101,14 +142,38 @@ impl TelegramOutbox {
         message_id: &str,
         text: &str,
     ) -> Result<(), teloxide::RequestError> {
+        self.edit_draft(chat_id, message_id, text, None, false)
+            .await
+    }
+
+    pub async fn edit_draft(
+        &self,
+        chat_id: ChatId,
+        message_id: &str,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        disable_web_page_preview: bool,
+    ) -> Result<(), teloxide::RequestError> {
         let Some(message_id) = parse_message_id(message_id) else {
             return Err(invalid_message_id_error(message_id));
         };
 
         let bot = self.bot()?;
-        bot.edit_message_text(chat_id, message_id, text.to_string())
-            .await
-            .map(|_| ())
+        let mut request = bot.edit_message_text(chat_id, message_id, text.to_string());
+        if let Some(parse_mode) = parse_mode {
+            request = request.parse_mode(parse_mode);
+        }
+        if disable_web_page_preview {
+            request = request.link_preview_options(LinkPreviewOptions {
+                is_disabled: true,
+                url: None,
+                prefer_small_media: false,
+                prefer_large_media: false,
+                show_above_text: false,
+            });
+        }
+
+        request.await.map(|_| ())
     }
 
     pub async fn delete_message(
