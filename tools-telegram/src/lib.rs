@@ -31,7 +31,7 @@ pub struct SendMessageTool {
 }
 
 impl Tool for SendMessageTool {
-    const NAME: &'static str = "telegram.sendMessage";
+    const NAME: &'static str = "telegram_sendMessage";
 
     type Error = ToolError;
     type Args = SendMessageArgs;
@@ -39,7 +39,7 @@ impl Tool for SendMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "telegram.sendMessage".into(),
+            name: "telegram_sendMessage".into(),
             description: "Send a text message to the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
@@ -97,7 +97,7 @@ pub struct EditMessageTool {
 }
 
 impl Tool for EditMessageTool {
-    const NAME: &'static str = "telegram.editMessage";
+    const NAME: &'static str = "telegram_editMessage";
 
     type Error = ToolError;
     type Args = EditMessageArgs;
@@ -105,7 +105,7 @@ impl Tool for EditMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "telegram.editMessage".into(),
+            name: "telegram_editMessage".into(),
             description: "Edit a previously sent message in the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
@@ -159,7 +159,7 @@ pub struct DeleteMessageTool {
 }
 
 impl Tool for DeleteMessageTool {
-    const NAME: &'static str = "telegram.deleteMessage";
+    const NAME: &'static str = "telegram_deleteMessage";
 
     type Error = ToolError;
     type Args = DeleteMessageArgs;
@@ -167,7 +167,7 @@ impl Tool for DeleteMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "telegram.deleteMessage".into(),
+            name: "telegram_deleteMessage".into(),
             description: "Delete a message from the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
@@ -207,7 +207,7 @@ pub struct SendChatActionTool {
 }
 
 impl Tool for SendChatActionTool {
-    const NAME: &'static str = "telegram.sendChatAction";
+    const NAME: &'static str = "telegram_sendChatAction";
 
     type Error = ToolError;
     type Args = SendChatActionArgs;
@@ -215,7 +215,7 @@ impl Tool for SendChatActionTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "telegram.sendChatAction".into(),
+            name: "telegram_sendChatAction".into(),
             description: "Broadcast a chat action (typing indicator, uploading status, etc.)"
                 .into(),
             parameters: json!({

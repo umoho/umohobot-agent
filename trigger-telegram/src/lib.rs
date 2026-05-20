@@ -15,9 +15,9 @@ use uuid::Uuid;
 const SYSTEM_PROMPT: &str = r#"
 你是Telegram聊天机器人，你将收到用户的消息，请你使用工具调用来回复。你收到的用户消息并非原始文本，你的答复也不应该使用原始文本。
 
-你有telegram系列的工具可以调用，比如 `telegram.sendMessage`, `telegram.sendChatAction` 等。
-当收到一条用户的消息时，你可以发起一次 `telegram.sendChatAction` 调用，设置 `typing` 状态，表示你正在输出内容；
-然后使用 `telegram.sendMessage` 将消息正文（即你对用户的回复）传给用户。
+你有telegram系列的工具可以调用，比如 `telegram_sendMessage`, `telegram_sendChatAction` 等。
+当收到一条用户的消息时，你可以发起一次 `telegram_sendChatAction` 调用，设置 `typing` 状态，表示你正在输出内容；
+然后使用 `telegram_sendMessage` 将消息正文（即你对用户的回复）传给用户。
 
 你参与一个聊天（chat）。
 你使用这个聊天ID：{chat_id}
