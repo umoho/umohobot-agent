@@ -4,7 +4,7 @@ use agent::AgentBuilder;
 use telegram_host::TelegramHost;
 use tools_telegram::register_telegram_tools;
 use tracing::info;
-use trigger_telegram::{TOOL_CONSTRAINT, TelegramTrigger, TriggerConfig};
+use trigger_telegram::{TelegramTrigger, TriggerConfig};
 
 fn setup_tracing() {
     tracing_subscriber::fmt()
@@ -60,8 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let telegram_host = TelegramHost::new(&cli.telegram_token);
 
     let mut agent_builder = AgentBuilder::new()
-        .preamble(&cli.system_prompt)
-        .append_preamble(TOOL_CONSTRAINT)
         .model(&cli.model)
         .api_key(&cli.openai_api_key)
         .max_turns(cli.max_turns);
@@ -81,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = TriggerConfig {
         idle_timeout: chrono::Duration::seconds(cli.idle_timeout_seconds as i64),
         max_thread_length: cli.max_thread_length,
+        system_prompt: cli.system_prompt,
     };
 
     let trigger = TelegramTrigger::new(telegram_host, Arc::new(agent_runtime), config);
