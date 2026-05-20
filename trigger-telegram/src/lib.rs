@@ -61,7 +61,6 @@ impl TelegramTrigger {
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bot = self.host.bot().clone();
-        let host = Arc::new(self.host);
         let agent = self.agent;
         let system_prompt = Arc::new(self.system_prompt);
         let config = Arc::new(self.config);
@@ -69,7 +68,7 @@ impl TelegramTrigger {
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![host, agent, system_prompt, config, chat_map];
+        let dependencies = dptree::deps![agent, system_prompt, config, chat_map];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -84,7 +83,6 @@ impl TelegramTrigger {
 
 async fn handle_message(
     msg: Message,
-    host: Arc<TelegramHost>,
     agent: Arc<dyn AgentHandle>,
     system_prompt: Arc<String>,
     config: Arc<TriggerConfig>,
@@ -104,23 +102,16 @@ async fn handle_message(
         return Ok(());
     }
 
-    host.set_typing(chat_id).await.ok();
-
     let thread_id = resolve_thread(chat_id, &chat_map, &*agent, &system_prompt, &config).await;
 
-    let response = agent.run_turn(thread_id, text).await;
-
-    host.reset_typing(chat_id).await.ok();
-
-    match response {
+    match agent.run_turn(thread_id, text).await {
         Ok(text) => {
             if !text.is_empty() {
-                host.send_message(chat_id, &text).await?;
+                debug!(%chat_id, "agent response: {text}");
             }
         }
         Err(e) => {
             error!(%chat_id, error = %e, "agent error");
-            host.send_message(chat_id, &format!("Error: {e}")).await?;
         }
     }
 

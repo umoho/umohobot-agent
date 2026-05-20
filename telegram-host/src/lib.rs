@@ -1,6 +1,6 @@
 use teloxide::Bot;
 use teloxide::prelude::Requester;
-use teloxide::types::{ChatAction, ChatId, Message, MessageId};
+use teloxide::types::{ChatId, Message, MessageId};
 use tracing::debug;
 
 #[derive(Debug, thiserror::Error)]
@@ -60,20 +60,6 @@ impl TelegramHost {
         self.bot
             .delete_message(chat_id, MessageId(message_id))
             .await?;
-        Ok(())
-    }
-
-    pub async fn set_typing(&self, chat_id: ChatId) -> Result<(), TelegramError> {
-        debug!(%chat_id, "setting typing indicator");
-        self.bot
-            .send_chat_action(chat_id, ChatAction::Typing)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn reset_typing(&self, chat_id: ChatId) -> Result<(), TelegramError> {
-        debug!(%chat_id, "reset_typing: Telegram has no cancel action, this is a no-op");
-        let _ = chat_id;
         Ok(())
     }
 }

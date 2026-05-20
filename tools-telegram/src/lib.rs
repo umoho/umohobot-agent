@@ -4,18 +4,26 @@ use rig_core::tool::server::ToolServerHandle;
 use serde::Deserialize;
 use serde_json::json;
 use telegram_host::TelegramHost;
-use teloxide::types::ChatId;
+use teloxide::RequestError;
+use teloxide::payloads::{EditMessageTextSetters, SendMessageSetters};
+use teloxide::prelude::Requester;
+use teloxide::types::{ChatAction, ChatId, MessageId, ParseMode, ReplyParameters};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("Telegram error: {0}")]
     Telegram(#[from] telegram_host::TelegramError),
+    #[error("Telegram request error: {0}")]
+    Request(#[from] RequestError),
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendMessageArgs {
     pub chat_id: i64,
     pub text: String,
+    pub reply_to_message_id: Option<i32>,
+    pub parse_mode: Option<ParseMode>,
 }
 
 pub struct SendMessageTool {
@@ -23,7 +31,7 @@ pub struct SendMessageTool {
 }
 
 impl Tool for SendMessageTool {
-    const NAME: &'static str = "send_message";
+    const NAME: &'static str = "telegram.sendMessage";
 
     type Error = ToolError;
     type Args = SendMessageArgs;
@@ -31,38 +39,57 @@ impl Tool for SendMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "send_message".into(),
+            name: "telegram.sendMessage".into(),
             description: "Send a text message to the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "chat_id": {
+                    "chatId": {
                         "type": "integer",
-                        "description": "Telegram chat ID to send the message to"
+                        "description": "Telegram chat ID"
                     },
                     "text": {
                         "type": "string",
-                        "description": "The message text to send"
+                        "description": "Message text"
+                    },
+                    "replyToMessageId": {
+                        "type": "integer",
+                        "description": "Optional: ID of the message to reply to"
+                    },
+                    "parseMode": {
+                        "type": "string",
+                        "enum": ["MarkdownV2", "HTML", "Markdown"],
+                        "description": "Optional: parse mode for the message text"
                     }
                 },
-                "required": ["chat_id", "text"]
+                "required": ["chatId", "text"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.host
-            .send_message(ChatId(args.chat_id), &args.text)
-            .await?;
+        let mut req = self
+            .host
+            .bot()
+            .send_message(ChatId(args.chat_id), &args.text);
+        if let Some(reply_id) = args.reply_to_message_id {
+            req = req.reply_parameters(ReplyParameters::new(MessageId(reply_id)));
+        }
+        if let Some(parse_mode) = args.parse_mode {
+            req = req.parse_mode(parse_mode);
+        }
+        req.await?;
         Ok(format!("Message sent to chat {}", args.chat_id))
     }
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EditMessageArgs {
     pub chat_id: i64,
     pub message_id: i32,
     pub text: String,
+    pub parse_mode: Option<ParseMode>,
 }
 
 pub struct EditMessageTool {
@@ -70,7 +97,7 @@ pub struct EditMessageTool {
 }
 
 impl Tool for EditMessageTool {
-    const NAME: &'static str = "edit_message";
+    const NAME: &'static str = "telegram.editMessage";
 
     type Error = ToolError;
     type Args = EditMessageArgs;
@@ -78,38 +105,50 @@ impl Tool for EditMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "edit_message".into(),
+            name: "telegram.editMessage".into(),
             description: "Edit a previously sent message in the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "chat_id": {
+                    "chatId": {
                         "type": "integer",
                         "description": "Telegram chat ID"
                     },
-                    "message_id": {
+                    "messageId": {
                         "type": "integer",
                         "description": "ID of the message to edit"
                     },
                     "text": {
                         "type": "string",
                         "description": "New text for the message"
+                    },
+                    "parseMode": {
+                        "type": "string",
+                        "enum": ["MarkdownV2", "HTML", "Markdown"],
+                        "description": "Optional: parse mode for the message text"
                     }
                 },
-                "required": ["chat_id", "message_id", "text"]
+                "required": ["chatId", "messageId", "text"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.host
-            .edit_message(ChatId(args.chat_id), args.message_id, &args.text)
-            .await?;
+        let mut req = self.host.bot().edit_message_text(
+            ChatId(args.chat_id),
+            MessageId(args.message_id),
+            &args.text,
+        );
+        if let Some(parse_mode) = args.parse_mode {
+            req = req.parse_mode(parse_mode);
+        }
+        req.await?;
         Ok(format!("Message {} edited", args.message_id))
     }
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteMessageArgs {
     pub chat_id: i64,
     pub message_id: i32,
@@ -120,7 +159,7 @@ pub struct DeleteMessageTool {
 }
 
 impl Tool for DeleteMessageTool {
-    const NAME: &'static str = "delete_message";
+    const NAME: &'static str = "telegram.deleteMessage";
 
     type Error = ToolError;
     type Args = DeleteMessageArgs;
@@ -128,108 +167,92 @@ impl Tool for DeleteMessageTool {
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "delete_message".into(),
+            name: "telegram.deleteMessage".into(),
             description: "Delete a message from the Telegram chat".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "chat_id": {
+                    "chatId": {
                         "type": "integer",
                         "description": "Telegram chat ID"
                     },
-                    "message_id": {
+                    "messageId": {
                         "type": "integer",
                         "description": "ID of the message to delete"
                     }
                 },
-                "required": ["chat_id", "message_id"]
+                "required": ["chatId", "messageId"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         self.host
-            .delete_message(ChatId(args.chat_id), args.message_id)
+            .bot()
+            .delete_message(ChatId(args.chat_id), MessageId(args.message_id))
             .await?;
         Ok(format!("Message {} deleted", args.message_id))
     }
 }
 
 #[derive(Deserialize)]
-pub struct SetTypingArgs {
+#[serde(rename_all = "camelCase")]
+pub struct SendChatActionArgs {
     pub chat_id: i64,
+    pub action: ChatAction,
 }
 
-pub struct SetTypingTool {
+pub struct SendChatActionTool {
     pub host: TelegramHost,
 }
 
-impl Tool for SetTypingTool {
-    const NAME: &'static str = "set_typing";
+impl Tool for SendChatActionTool {
+    const NAME: &'static str = "telegram.sendChatAction";
 
     type Error = ToolError;
-    type Args = SetTypingArgs;
+    type Args = SendChatActionArgs;
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
-            name: "set_typing".into(),
-            description: "Show a typing indicator in the Telegram chat".into(),
+            name: "telegram.sendChatAction".into(),
+            description: "Broadcast a chat action (typing indicator, uploading status, etc.)"
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "chat_id": {
+                    "chatId": {
                         "type": "integer",
                         "description": "Telegram chat ID"
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "typing",
+                            "upload_photo",
+                            "record_video",
+                            "upload_video",
+                            "record_voice",
+                            "upload_voice",
+                            "upload_document",
+                            "find_location",
+                            "record_video_note",
+                            "upload_video_note"
+                        ],
+                        "description": "Type of chat action to broadcast"
                     }
                 },
-                "required": ["chat_id"]
+                "required": ["chatId", "action"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.host.set_typing(ChatId(args.chat_id)).await?;
-        Ok(format!("Typing indicator set in chat {}", args.chat_id))
-    }
-}
-
-#[derive(Deserialize)]
-pub struct ResetTypingArgs {
-    pub chat_id: i64,
-}
-
-pub struct ResetTypingTool {
-    pub host: TelegramHost,
-}
-
-impl Tool for ResetTypingTool {
-    const NAME: &'static str = "reset_typing";
-
-    type Error = ToolError;
-    type Args = ResetTypingArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "reset_typing".into(),
-            description: "Remove the typing indicator from the Telegram chat".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "chat_id": {
-                        "type": "integer",
-                        "description": "Telegram chat ID"
-                    }
-                },
-                "required": ["chat_id"]
-            }),
-        }
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        self.host.reset_typing(ChatId(args.chat_id)).await?;
-        Ok(format!("Typing indicator reset in chat {}", args.chat_id))
+        self.host
+            .bot()
+            .send_chat_action(ChatId(args.chat_id), args.action)
+            .await?;
+        Ok(format!("Chat action broadcast in chat {}", args.chat_id))
     }
 }
 
@@ -246,9 +269,6 @@ pub async fn register_telegram_tools(
     handle
         .add_tool(DeleteMessageTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SetTypingTool { host: host.clone() })
-        .await?;
-    handle.add_tool(ResetTypingTool { host }).await?;
+    handle.add_tool(SendChatActionTool { host }).await?;
     Ok(())
 }
