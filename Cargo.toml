@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "agent", "tools-telegram", "trigger-telegram", "telegram-host"]
+members = [".", "agent", "tools-telegram", "tools-web", "trigger-telegram", "telegram-host"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -26,6 +26,7 @@ edition = "2024"
 agent = { path = "agent" }
 trigger-telegram = { path = "trigger-telegram" }
 tools-telegram = { path = "tools-telegram" }
+tools-web = { path = "tools-web" }
 telegram-host = { path = "telegram-host" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

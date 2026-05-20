@@ -1,0 +1,11 @@
+[package]
+name = "tools-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+web2llm = { version = "0.4", default-features = false }

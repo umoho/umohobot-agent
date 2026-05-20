@@ -2,10 +2,16 @@ mod thread;
 
 pub use thread::Thread;
 
+pub use rig_core::OneOrMany;
+pub use rig_core::completion::Message;
+pub use rig_core::completion::message::{
+    DocumentSourceKind, Image, ImageDetail, ImageMediaType, UserContent,
+};
+
 use chrono::Utc;
 use rig_core::agent::Agent;
 use rig_core::client::CompletionClient;
-use rig_core::completion::{self, AssistantContent, Chat, CompletionModel, Message};
+use rig_core::completion::{self, AssistantContent, Chat, CompletionModel};
 use rig_core::providers::openai;
 use std::collections::HashMap;
 use std::future::Future;
@@ -17,6 +23,24 @@ use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type ThreadStore = Arc<RwLock<HashMap<Uuid, Thread>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    Vision,
+    Audio,
+}
+
+impl std::str::FromStr for Capability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "vision" => Ok(Capability::Vision),
+            "audio" => Ok(Capability::Audio),
+            _ => Err(format!("Unknown capability: {s}")),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -30,20 +54,26 @@ pub trait AgentHandle: Send + Sync {
     fn run_turn<'a>(
         &'a self,
         thread_id: Uuid,
-        user_message: &'a str,
+        user_message: Message,
     ) -> BoxFuture<'a, Result<String, AgentError>>;
     fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
     fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
+    fn capabilities(&self) -> &[Capability];
 }
 
 pub struct AgentRuntime<M: CompletionModel> {
     agent: Agent<M>,
     threads: ThreadStore,
+    capabilities: Vec<Capability>,
 }
 
 impl<M: CompletionModel + 'static> AgentRuntime<M> {
-    pub fn new(agent: Agent<M>, threads: ThreadStore) -> Self {
-        Self { agent, threads }
+    pub fn new(agent: Agent<M>, threads: ThreadStore, capabilities: Vec<Capability>) -> Self {
+        Self {
+            agent,
+            threads,
+            capabilities,
+        }
     }
 
     pub fn agent(&self) -> &Agent<M> {
@@ -55,7 +85,7 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
     fn run_turn<'a>(
         &'a self,
         thread_id: Uuid,
-        user_message: &'a str,
+        user_message: Message,
     ) -> BoxFuture<'a, Result<String, AgentError>> {
         Box::pin(async move {
             let mut messages = {
@@ -74,11 +104,7 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 let max_attempts = 3;
                 let mut attempt = 0u32;
                 loop {
-                    match self
-                        .agent
-                        .chat(Message::user(user_message), &mut messages)
-                        .await
-                    {
+                    match self.agent.chat(user_message.clone(), &mut messages).await {
                         Ok(resp) => break resp,
                         Err(e) => {
                             if attempt < max_attempts - 1 && is_rate_limited(&e) {
@@ -137,6 +163,10 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
             }
         })
     }
+
+    fn capabilities(&self) -> &[Capability] {
+        &self.capabilities
+    }
 }
 
 pub struct AgentBuilder {
@@ -145,6 +175,7 @@ pub struct AgentBuilder {
     base_url: Option<String>,
     api_key: Option<String>,
     max_turns: Option<usize>,
+    capabilities: Vec<Capability>,
 }
 
 impl AgentBuilder {
@@ -155,6 +186,7 @@ impl AgentBuilder {
             base_url: None,
             api_key: None,
             max_turns: Some(10),
+            capabilities: Vec::new(),
         }
     }
 
@@ -188,6 +220,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn capabilities(mut self, caps: Vec<Capability>) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
     pub fn build(self) -> Result<AgentRuntime<impl CompletionModel>, rig_core::http_client::Error> {
         let mut client_builder =
             openai::Client::builder().api_key(self.api_key.unwrap_or_else(|| {
@@ -209,6 +246,7 @@ impl AgentBuilder {
         Ok(AgentRuntime::new(
             agent,
             Arc::new(RwLock::new(HashMap::new())),
+            self.capabilities,
         ))
     }
 }

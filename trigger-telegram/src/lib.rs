@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent::AgentHandle;
+use agent::{
+    AgentHandle, Capability, ImageDetail, ImageMediaType, Message, OneOrMany, UserContent,
+};
 use chrono::{DateTime, Duration, Utc};
 use dptree;
 use telegram_host::{MessageCache, TelegramHost};
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, Message, Update};
-use tokio::sync::RwLock;
+use teloxide::types::{ChatId, Message as TgMessage, Update};
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -39,6 +42,8 @@ const SYSTEM_PROMPT: &str = r#"
 {system_prompt}
 "#;
 
+const ALBUM_TIMEOUT_MS: u64 = 500;
+
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub idle_timeout: Duration,
@@ -64,12 +69,24 @@ struct ThreadEntry {
 
 type ChatMap = Arc<RwLock<HashMap<ChatId, ThreadEntry>>>;
 
+type AlbumMap = Arc<Mutex<HashMap<String, Vec<TgMessage>>>>;
+
+#[derive(Clone)]
+struct AlbumBuffer(AlbumMap);
+
+impl AlbumBuffer {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
+
 pub struct TelegramTrigger {
     host: TelegramHost,
     agent: Arc<dyn AgentHandle>,
     config: TriggerConfig,
     chat_map: ChatMap,
     cache: MessageCache,
+    album_buffer: AlbumBuffer,
 }
 
 impl TelegramTrigger {
@@ -85,6 +102,7 @@ impl TelegramTrigger {
             config,
             cache,
             chat_map: Arc::new(RwLock::new(HashMap::new())),
+            album_buffer: AlbumBuffer::new(),
         }
     }
 
@@ -94,10 +112,12 @@ impl TelegramTrigger {
         let config = Arc::new(self.config);
         let chat_map = self.chat_map;
         let cache = self.cache;
+        let host = self.host;
+        let album_buffer = self.album_buffer;
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![agent, config, chat_map, cache];
+        let dependencies = dptree::deps![agent, config, chat_map, cache, host, album_buffer];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -111,52 +131,84 @@ impl TelegramTrigger {
 }
 
 async fn handle_message(
-    msg: Message,
+    msg: TgMessage,
     agent: Arc<dyn AgentHandle>,
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
     cache: MessageCache,
+    host: TelegramHost,
+    album_buffer: AlbumBuffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     cache.push(msg.clone()).await;
 
-    let chat_id = msg.chat.id;
-    let raw_text = match msg.text() {
-        Some(t) => t.to_owned(),
-        None => return Ok(()),
-    };
+    if let Some(group_id) = msg.media_group_id() {
+        let host = host.clone();
+        let agent = Arc::clone(&agent);
+        let config = Arc::clone(&config);
+        let chat_map = chat_map.clone();
+        let album_buffer_clone = album_buffer.clone();
+        let key = group_id.0.clone();
 
-    debug!(%chat_id, text_len = raw_text.len(), "received message");
+        {
+            let mut map = album_buffer.0.lock().await;
+            let entry = map.entry(key.clone()).or_default();
+            let is_first = entry.is_empty();
+            entry.push(msg);
+            if is_first {
+                tokio::spawn(async move {
+                    sleep(TokioDuration::from_millis(ALBUM_TIMEOUT_MS)).await;
+                    let msgs = {
+                        let mut map = album_buffer_clone.0.lock().await;
+                        map.remove(&key)
+                    };
+                    if let Some(msgs) = msgs {
+                        if let Err(e) =
+                            process_album(msgs, &host, &*agent, &config, &chat_map, &cache).await
+                        {
+                            error!("album processing error: {e}");
+                        }
+                    }
+                });
+            }
+        }
 
-    if raw_text.trim().is_empty() {
-        warn!(%chat_id, "received non-text or empty message, ignoring");
         return Ok(());
     }
 
-    let msg_id = msg.id.0;
-    let reply_info = msg
-        .reply_to_message()
-        .as_ref()
-        .map(|r| format!(" | reply_to:{}", r.id.0))
-        .unwrap_or_default();
-    let user_meta = match msg.from {
-        Some(u) => {
-            let name = u
-                .username
-                .map(|n| format!("@{}", n))
-                .unwrap_or(u.first_name);
-            format!(
-                "[{} | user_id:{} | msg_id:{}{}] ",
-                name, u.id.0, msg_id, reply_info
-            )
-        }
-        None => String::new(),
-    };
+    process_single_message(msg, &host, &*agent, &config, &chat_map, &cache).await
+}
 
-    let text = format!("{}{}", user_meta, raw_text);
+async fn process_single_message(
+    msg: TgMessage,
+    host: &TelegramHost,
+    agent: &dyn AgentHandle,
+    config: &TriggerConfig,
+    chat_map: &ChatMap,
+    _cache: &MessageCache,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let chat_id = msg.chat.id;
+    let caption = msg.caption();
+    let has_photo = msg.photo().is_some();
+    let has_sticker = msg.sticker().is_some();
+    let raw_text = msg.text().or(caption).unwrap_or("").to_owned();
 
-    let thread_id = resolve_thread(chat_id, &chat_map, &*agent, &config).await;
+    debug!(%chat_id, text_len = raw_text.len(), has_photo, has_sticker, "received message");
 
-    match agent.run_turn(thread_id, &text).await {
+    let supports_vision = agent.capabilities().contains(&Capability::Vision);
+
+    let user_meta = build_user_meta(&msg);
+    let content = build_user_content(&msg, &user_meta, &raw_text, host, supports_vision).await?;
+
+    if content.is_empty() {
+        warn!(%chat_id, "no content to process");
+        return Ok(());
+    }
+
+    let agent_msg = Message::User { content };
+
+    let thread_id = resolve_thread(chat_id, chat_map, agent, config).await;
+
+    match agent.run_turn(thread_id, agent_msg).await {
         Ok(text) => {
             if !text.is_empty() {
                 debug!(%chat_id, "agent response: {text}");
@@ -168,6 +220,183 @@ async fn handle_message(
     }
 
     Ok(())
+}
+
+async fn process_album(
+    msgs: Vec<TgMessage>,
+    host: &TelegramHost,
+    agent: &dyn AgentHandle,
+    config: &TriggerConfig,
+    chat_map: &ChatMap,
+    _cache: &MessageCache,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+
+    let chat_id = msgs[0].chat.id;
+    let supports_vision = agent.capabilities().contains(&Capability::Vision);
+
+    let mut content = Vec::new();
+    let mut text_parts = Vec::new();
+    let mut has_photo = false;
+
+    for msg in &msgs {
+        let user_meta = build_user_meta(msg);
+        let caption = msg.caption().unwrap_or("");
+
+        if supports_vision {
+            if let Some(photos) = msg.photo() {
+                if let Some(largest) = photos.last() {
+                    match host.get_file_url(&largest.file.id).await {
+                        Ok(url) => {
+                            content.push(UserContent::image_url(
+                                url,
+                                Some(ImageMediaType::JPEG),
+                                Some(ImageDetail::Auto),
+                            ));
+                            has_photo = true;
+                        }
+                        Err(e) => warn!(%chat_id, error = %e, "failed to get photo URL"),
+                    }
+                }
+            }
+        }
+
+        if !user_meta.is_empty() || !caption.is_empty() {
+            text_parts.push(format!("{}{}", user_meta, caption));
+        }
+    }
+
+    if !text_parts.is_empty() {
+        let combined_text = text_parts.join("\n");
+        content.push(UserContent::text(combined_text));
+    }
+
+    if content.is_empty() {
+        if !supports_vision && has_photo {
+            let text = "[User sent a photo album]".to_owned();
+            content.push(UserContent::text(text));
+        } else {
+            warn!(%chat_id, "album has no processable content");
+            return Ok(());
+        }
+    }
+
+    let agent_msg = Message::User {
+        content: OneOrMany::many(content).unwrap(),
+    };
+
+    let thread_id = resolve_thread(chat_id, chat_map, agent, config).await;
+
+    match agent.run_turn(thread_id, agent_msg).await {
+        Ok(text) => {
+            if !text.is_empty() {
+                debug!(%chat_id, "agent album response: {text}");
+            }
+        }
+        Err(e) => {
+            error!(%chat_id, error = %e, "album agent error");
+        }
+    }
+
+    Ok(())
+}
+
+fn build_user_meta(msg: &TgMessage) -> String {
+    let msg_id = msg.id.0;
+    let reply_info = msg
+        .reply_to_message()
+        .as_ref()
+        .map(|r| format!(" | reply_to:{}", r.id.0))
+        .unwrap_or_default();
+    match msg.from.as_ref() {
+        Some(u) => {
+            let name = u
+                .username
+                .as_deref()
+                .map(|n| format!("@{}", n))
+                .unwrap_or(u.first_name.clone());
+            format!(
+                "[{} | user_id:{} | msg_id:{}{}] ",
+                name, u.id.0, msg_id, reply_info
+            )
+        }
+        None => String::new(),
+    }
+}
+
+async fn build_user_content(
+    msg: &TgMessage,
+    user_meta: &str,
+    raw_text: &str,
+    host: &TelegramHost,
+    supports_vision: bool,
+) -> Result<OneOrMany<UserContent>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut items: Vec<UserContent> = Vec::new();
+    let has_photo = msg.photo().is_some();
+    let has_sticker = msg.sticker().is_some();
+    let prefixed_text = format!("{}{}", user_meta, raw_text);
+
+    if supports_vision && has_photo {
+        if let Some(photos) = msg.photo() {
+            if let Some(largest) = photos.last() {
+                match host.get_file_url(&largest.file.id).await {
+                    Ok(url) => {
+                        items.push(UserContent::image_url(
+                            url,
+                            Some(ImageMediaType::JPEG),
+                            Some(ImageDetail::Auto),
+                        ));
+                    }
+                    Err(e) => warn!("failed to get photo URL: {e}"),
+                }
+            }
+        }
+    } else if has_photo {
+        let fallback = if raw_text.is_empty() {
+            format!("{}[User sent a photo]", user_meta)
+        } else {
+            prefixed_text.clone()
+        };
+        items.push(UserContent::text(fallback));
+        return Ok(OneOrMany::one(items.remove(0)));
+    }
+
+    if supports_vision && has_sticker {
+        if let Some(sticker) = msg.sticker() {
+            match host.get_file_url(&sticker.file.id).await {
+                Ok(url) => {
+                    items.push(UserContent::image_url(url, None, Some(ImageDetail::Auto)));
+                }
+                Err(e) => warn!("failed to get sticker URL: {e}"),
+            }
+        }
+    } else if has_sticker {
+        let fallback = if raw_text.is_empty() {
+            format!("{}[User sent a sticker]", user_meta)
+        } else {
+            prefixed_text.clone()
+        };
+        items.push(UserContent::text(fallback));
+        return Ok(OneOrMany::one(items.remove(0)));
+    }
+
+    if !prefixed_text.trim().is_empty() {
+        items.push(UserContent::text(prefixed_text));
+    } else if items.is_empty() {
+        warn!("message has no text and no supported media");
+        return Ok(OneOrMany::one(UserContent::text(format!(
+            "{}[Unsupported message]",
+            user_meta
+        ))));
+    }
+
+    if items.len() == 1 {
+        return Ok(OneOrMany::one(items.remove(0)));
+    }
+
+    Ok(OneOrMany::many(items).unwrap())
 }
 
 async fn resolve_thread(

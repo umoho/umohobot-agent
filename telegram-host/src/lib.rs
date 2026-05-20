@@ -4,7 +4,7 @@ pub use cache::MessageCache;
 
 use teloxide::Bot;
 use teloxide::prelude::Requester;
-use teloxide::types::{ChatId, Message, MessageId};
+use teloxide::types::{ChatId, FileId, Message, MessageId};
 use tracing::debug;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,21 +16,38 @@ pub enum TelegramError {
 #[derive(Clone)]
 pub struct TelegramHost {
     bot: Bot,
+    token: String,
 }
 
 impl TelegramHost {
     pub fn new(token: impl Into<String>) -> Self {
-        let bot = Bot::new(token);
-        Self { bot }
+        let token = token.into();
+        let bot = Bot::new(&token);
+        Self { bot, token }
     }
 
     pub fn from_env() -> Self {
         let bot = Bot::from_env();
-        Self { bot }
+        let token = bot.token().to_owned();
+        Self { bot, token }
     }
 
     pub fn bot(&self) -> &Bot {
         &self.bot
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub async fn get_file_url(&self, file_id: &FileId) -> Result<String, TelegramError> {
+        let file = self.bot.get_file(file_id.clone()).await?;
+        Ok(format!(
+            "{}file/bot{}/{}",
+            self.bot.api_url(),
+            self.token,
+            file.path,
+        ))
     }
 
     pub async fn send_message(

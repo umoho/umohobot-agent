@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use agent::AgentBuilder;
+use agent::{AgentBuilder, Capability};
 use telegram_host::{MessageCache, TelegramHost};
 use tools_telegram::register_telegram_tools;
+use tools_web::WebFetchTool;
 use tracing::info;
 use trigger_telegram::{TelegramTrigger, TriggerConfig};
 
@@ -41,6 +42,9 @@ struct Cli {
 
     #[arg(long, default_value = "10")]
     max_turns: usize,
+
+    #[arg(long, value_delimiter = ',')]
+    capabilities: Vec<Capability>,
 }
 
 #[tokio::main]
@@ -54,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         idle_timeout = cli.idle_timeout_seconds,
         max_thread_length = cli.max_thread_length,
         max_turns = cli.max_turns,
+        capabilities = ?cli.capabilities,
         "starting umohobot"
     );
 
@@ -62,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut agent_builder = AgentBuilder::new()
         .model(&cli.model)
         .api_key(&cli.openai_api_key)
-        .max_turns(cli.max_turns);
+        .max_turns(cli.max_turns)
+        .capabilities(cli.capabilities);
 
     if let Some(base_url) = &cli.openai_base_url {
         agent_builder = agent_builder.base_url(base_url);
@@ -78,6 +84,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cache.clone(),
     )
     .await?;
+
+    agent_runtime
+        .agent()
+        .tool_server_handle
+        .add_tool(WebFetchTool)
+        .await?;
 
     let config = TriggerConfig {
         idle_timeout: chrono::Duration::seconds(cli.idle_timeout_seconds as i64),
