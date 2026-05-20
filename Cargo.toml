@@ -1,10 +1,36 @@
 [workspace]
-members = [".", "tools-telegram", "trigger-telegram", "telegram-host"]
+members = [".", "agent", "tools-telegram", "trigger-telegram", "telegram-host"]
 resolver = "2"
 
+[workspace.dependencies]
+rig-core = "0.37.0"
+teloxide = "0.17.0"
+tokio = { version = "1.42", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+toml = "0.8"
+dptree = "0.5"
+
 [package]
-name = "umohobot-agent"
+name = "umohobot"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agent = { path = "agent" }
+trigger-telegram = { path = "trigger-telegram" }
+tools-telegram = { path = "tools-telegram" }
+telegram-host = { path = "telegram-host" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }

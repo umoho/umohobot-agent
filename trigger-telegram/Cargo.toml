@@ -1,0 +1,16 @@
+[package]
+name = "trigger-telegram"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+teloxide = { workspace = true }
+telegram-host = { path = "../telegram-host" }
+agent = { path = "../agent" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dptree = { workspace = true }
