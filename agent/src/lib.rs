@@ -33,6 +33,7 @@ pub trait AgentHandle: Send + Sync {
         user_message: &'a str,
     ) -> BoxFuture<'a, Result<String, AgentError>>;
     fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
+    fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
 }
 
 pub struct AgentRuntime<M: CompletionModel> {
@@ -125,6 +126,15 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
             let clone = thread.clone();
             threads.insert(id, thread);
             clone
+        })
+    }
+
+    fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut threads = self.threads.write().await;
+            if let Some(thread) = threads.get_mut(&thread_id) {
+                thread.messages.push(Message::system(text));
+            }
         })
     }
 }

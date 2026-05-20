@@ -12,6 +12,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+const CHAT_ID_CONTEXT: &str = "Current Telegram chat ID: ";
+
 pub const TOOL_CONSTRAINT: &str = "CRITICAL: Your text output is NOT shown to anyone. \
      You MUST use the telegram.sendMessage tool to communicate with the user. \
      Never return text directly — it will be discarded and lost forever.";
@@ -130,6 +132,9 @@ async fn resolve_thread(
             if expired {
                 let thread_id = Uuid::new_v4();
                 agent.get_or_create_thread(thread_id).await;
+                agent
+                    .append_system_message(thread_id, &format!("{}{}", CHAT_ID_CONTEXT, chat_id.0))
+                    .await;
                 *entry = ThreadEntry {
                     thread_id,
                     last_activity: now,
@@ -146,6 +151,9 @@ async fn resolve_thread(
         None => {
             let thread_id = Uuid::new_v4();
             agent.get_or_create_thread(thread_id).await;
+            agent
+                .append_system_message(thread_id, &format!("{}{}", CHAT_ID_CONTEXT, chat_id.0))
+                .await;
             map.insert(
                 chat_id,
                 ThreadEntry {
