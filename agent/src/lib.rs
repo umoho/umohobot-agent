@@ -5,14 +5,14 @@ pub use thread::Thread;
 use chrono::Utc;
 use rig_core::agent::Agent;
 use rig_core::client::CompletionClient;
-use rig_core::completion::{self, Chat, CompletionModel, Message};
+use rig_core::completion::{self, AssistantContent, Chat, CompletionModel, Message};
 use rig_core::providers::openai;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -32,27 +32,17 @@ pub trait AgentHandle: Send + Sync {
         thread_id: Uuid,
         user_message: &'a str,
     ) -> BoxFuture<'a, Result<String, AgentError>>;
-    fn get_or_create_thread<'a>(
-        &'a self,
-        id: Uuid,
-        system_prompt: &'a str,
-    ) -> BoxFuture<'a, Thread>;
-    fn system_prompt(&self) -> &str;
+    fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
 }
 
 pub struct AgentRuntime<M: CompletionModel> {
     agent: Agent<M>,
     threads: ThreadStore,
-    system_prompt: String,
 }
 
 impl<M: CompletionModel + 'static> AgentRuntime<M> {
-    pub fn new(agent: Agent<M>, threads: ThreadStore, system_prompt: impl Into<String>) -> Self {
-        Self {
-            agent,
-            threads,
-            system_prompt: system_prompt.into(),
-        }
+    pub fn new(agent: Agent<M>, threads: ThreadStore) -> Self {
+        Self { agent, threads }
     }
 
     pub fn agent(&self) -> &Agent<M> {
@@ -76,6 +66,8 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
             };
 
             let messages_len = messages.len();
+
+            trace!(thread_id = %thread_id, messages = ?messages, "run_turn: messages before chat");
 
             let response = {
                 let max_attempts = 3;
@@ -102,6 +94,8 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 }
             };
 
+            let reasoning = extract_reasoning(&messages[messages_len..]);
+
             {
                 let mut threads = self.threads.write().await;
                 if let Some(thread) = threads.get_mut(&thread_id) {
@@ -110,16 +104,15 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 }
             }
 
-            debug!(thread_id = %thread_id, "run_turn completed");
+            debug!(thread_id = %thread_id, response_len = response.len(), "run_turn completed");
+            if let Some(r) = &reasoning {
+                trace!(thread_id = %thread_id, reasoning = %r, "run_turn: model reasoning");
+            }
             Ok(response)
         })
     }
 
-    fn get_or_create_thread<'a>(
-        &'a self,
-        id: Uuid,
-        system_prompt: &'a str,
-    ) -> BoxFuture<'a, Thread> {
+    fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread> {
         Box::pin(async move {
             let threads = self.threads.read().await;
             if let Some(thread) = threads.get(&id) {
@@ -128,20 +121,16 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
             drop(threads);
 
             let mut threads = self.threads.write().await;
-            let thread = Thread::new(system_prompt);
+            let thread = Thread::new();
             let clone = thread.clone();
             threads.insert(id, thread);
             clone
         })
     }
-
-    fn system_prompt(&self) -> &str {
-        &self.system_prompt
-    }
 }
 
 pub struct AgentBuilder {
-    system_prompt: String,
+    preamble: Option<String>,
     model: String,
     base_url: Option<String>,
     api_key: Option<String>,
@@ -149,14 +138,24 @@ pub struct AgentBuilder {
 }
 
 impl AgentBuilder {
-    pub fn new(system_prompt: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            system_prompt: system_prompt.into(),
+            preamble: None,
             model: "gpt-4o-mini".into(),
             base_url: None,
             api_key: None,
             max_turns: Some(10),
         }
+    }
+
+    pub fn preamble(mut self, preamble: &str) -> Self {
+        self.preamble = Some(preamble.into());
+        self
+    }
+
+    pub fn append_preamble(mut self, doc: &str) -> Self {
+        self.preamble = Some(format!("{}\n{}", self.preamble.unwrap_or_default(), doc));
+        self
     }
 
     pub fn model(mut self, model: impl Into<String>) -> Self {
@@ -189,19 +188,35 @@ impl AgentBuilder {
         }
         let client = client_builder.build()?;
 
-        let agent = client
-            .completions_api()
-            .agent(&self.model)
-            .without_preamble()
+        let mut agent_builder = client.completions_api().agent(&self.model);
+        if let Some(preamble) = &self.preamble {
+            agent_builder = agent_builder.preamble(preamble);
+        }
+        let agent = agent_builder
             .default_max_turns(self.max_turns.unwrap_or(10))
             .build();
 
         Ok(AgentRuntime::new(
             agent,
             Arc::new(RwLock::new(HashMap::new())),
-            &self.system_prompt,
         ))
     }
+}
+
+fn extract_reasoning(messages: &[Message]) -> Option<String> {
+    for msg in messages.iter().rev() {
+        if let Message::Assistant { content, .. } = msg {
+            for c in content.iter() {
+                if let AssistantContent::Reasoning(reasoning) = c {
+                    let text = reasoning.display_text();
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_rate_limited(err: &completion::PromptError) -> bool {

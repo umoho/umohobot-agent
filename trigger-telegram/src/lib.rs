@@ -12,6 +12,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+pub const TOOL_CONSTRAINT: &str = "CRITICAL: Your text output is NOT shown to anyone. \
+     You MUST use the telegram.sendMessage tool to communicate with the user. \
+     Never return text directly — it will be discarded and lost forever.";
+
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub idle_timeout: Duration,
@@ -38,22 +42,15 @@ type ChatMap = Arc<RwLock<HashMap<ChatId, ThreadEntry>>>;
 pub struct TelegramTrigger {
     host: TelegramHost,
     agent: Arc<dyn AgentHandle>,
-    system_prompt: String,
     config: TriggerConfig,
     chat_map: ChatMap,
 }
 
 impl TelegramTrigger {
-    pub fn new(
-        host: TelegramHost,
-        agent: Arc<dyn AgentHandle>,
-        system_prompt: impl Into<String>,
-        config: TriggerConfig,
-    ) -> Self {
+    pub fn new(host: TelegramHost, agent: Arc<dyn AgentHandle>, config: TriggerConfig) -> Self {
         Self {
             host,
             agent,
-            system_prompt: system_prompt.into(),
             config,
             chat_map: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -62,13 +59,12 @@ impl TelegramTrigger {
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bot = self.host.bot().clone();
         let agent = self.agent;
-        let system_prompt = Arc::new(self.system_prompt);
         let config = Arc::new(self.config);
         let chat_map = self.chat_map;
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![agent, system_prompt, config, chat_map];
+        let dependencies = dptree::deps![agent, config, chat_map];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -84,7 +80,6 @@ impl TelegramTrigger {
 async fn handle_message(
     msg: Message,
     agent: Arc<dyn AgentHandle>,
-    system_prompt: Arc<String>,
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -102,7 +97,7 @@ async fn handle_message(
         return Ok(());
     }
 
-    let thread_id = resolve_thread(chat_id, &chat_map, &*agent, &system_prompt, &config).await;
+    let thread_id = resolve_thread(chat_id, &chat_map, &*agent, &config).await;
 
     match agent.run_turn(thread_id, text).await {
         Ok(text) => {
@@ -122,7 +117,6 @@ async fn resolve_thread(
     chat_id: ChatId,
     chat_map: &ChatMap,
     agent: &dyn AgentHandle,
-    system_prompt: &str,
     config: &TriggerConfig,
 ) -> Uuid {
     let mut map = chat_map.write().await;
@@ -135,7 +129,7 @@ async fn resolve_thread(
 
             if expired {
                 let thread_id = Uuid::new_v4();
-                agent.get_or_create_thread(thread_id, system_prompt).await;
+                agent.get_or_create_thread(thread_id).await;
                 *entry = ThreadEntry {
                     thread_id,
                     last_activity: now,
@@ -151,7 +145,7 @@ async fn resolve_thread(
         }
         None => {
             let thread_id = Uuid::new_v4();
-            agent.get_or_create_thread(thread_id, system_prompt).await;
+            agent.get_or_create_thread(thread_id).await;
             map.insert(
                 chat_id,
                 ThreadEntry {

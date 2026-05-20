@@ -12,13 +12,13 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn new(system_prompt: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             created_at: now,
             last_activity: now,
-            messages: vec![Message::system(system_prompt)],
+            messages: vec![],
         }
     }
 
