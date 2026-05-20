@@ -1,3 +1,7 @@
+mod cache;
+
+pub use cache::MessageCache;
+
 use teloxide::Bot;
 use teloxide::prelude::Requester;
 use teloxide::types::{ChatId, Message, MessageId};

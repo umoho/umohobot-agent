@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use agent::AgentBuilder;
-use telegram_host::TelegramHost;
+use telegram_host::{MessageCache, TelegramHost};
 use tools_telegram::register_telegram_tools;
 use tracing::info;
 use trigger_telegram::{TelegramTrigger, TriggerConfig};
@@ -70,9 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let agent_runtime = agent_builder.build()?;
 
+    let cache = MessageCache::new(200);
+
     register_telegram_tools(
         &agent_runtime.agent().tool_server_handle,
         telegram_host.clone(),
+        cache.clone(),
     )
     .await?;
 
@@ -82,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         system_prompt: cli.system_prompt,
     };
 
-    let trigger = TelegramTrigger::new(telegram_host, Arc::new(agent_runtime), config);
+    let trigger = TelegramTrigger::new(telegram_host, Arc::new(agent_runtime), config, cache);
 
     trigger.start().await
 }

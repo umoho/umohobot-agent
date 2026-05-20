@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agent::AgentHandle;
 use chrono::{DateTime, Duration, Utc};
 use dptree;
-use telegram_host::TelegramHost;
+use telegram_host::{MessageCache, TelegramHost};
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, Message, Update};
@@ -22,7 +22,10 @@ const SYSTEM_PROMPT: &str = r#"
 你参与一个聊天（chat）。
 你使用这个聊天ID：{chat_id}
 你所在的聊天可能有多个用户参与（群聊），请你区分不同的用户，并基于他们先前的消息来考虑回答。
-你会收到这种形式的用户消息：[@用户名 | user_id:用户ID | msg_id:消息ID] 消息内容
+你会收到这种形式的用户消息：[@用户名 | user_id:用户ID | msg_id:消息ID | reply_to:消息ID] 消息内容
+其中方括号内是消息元数据。当存在 `reply_to:消息ID` 时，表示这条消息是回复某条历史消息。
+你可以使用 `telegram_query_message` 工具传入该消息ID来获取被回复消息的内容。
+你也可以使用 `telegram_query_messages`、`telegram_query_search`、`telegram_query_messages_by_user` 等工具翻阅更多聊天历史。
 你应该提取消息内容，然后思考对用户的回复，然后使用工具调用来回复。
 
 注意：
@@ -66,14 +69,21 @@ pub struct TelegramTrigger {
     agent: Arc<dyn AgentHandle>,
     config: TriggerConfig,
     chat_map: ChatMap,
+    cache: MessageCache,
 }
 
 impl TelegramTrigger {
-    pub fn new(host: TelegramHost, agent: Arc<dyn AgentHandle>, config: TriggerConfig) -> Self {
+    pub fn new(
+        host: TelegramHost,
+        agent: Arc<dyn AgentHandle>,
+        config: TriggerConfig,
+        cache: MessageCache,
+    ) -> Self {
         Self {
             host,
             agent,
             config,
+            cache,
             chat_map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -83,10 +93,11 @@ impl TelegramTrigger {
         let agent = self.agent;
         let config = Arc::new(self.config);
         let chat_map = self.chat_map;
+        let cache = self.cache;
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![agent, config, chat_map];
+        let dependencies = dptree::deps![agent, config, chat_map, cache];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -104,7 +115,10 @@ async fn handle_message(
     agent: Arc<dyn AgentHandle>,
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
+    cache: MessageCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    cache.push(msg.clone()).await;
+
     let chat_id = msg.chat.id;
     let raw_text = match msg.text() {
         Some(t) => t.to_owned(),
@@ -113,20 +127,27 @@ async fn handle_message(
 
     debug!(%chat_id, text_len = raw_text.len(), "received message");
 
-    // TODO: handle non-text content (images, stickers, etc.)
     if raw_text.trim().is_empty() {
         warn!(%chat_id, "received non-text or empty message, ignoring");
         return Ok(());
     }
 
     let msg_id = msg.id.0;
+    let reply_info = msg
+        .reply_to_message()
+        .as_ref()
+        .map(|r| format!(" | reply_to:{}", r.id.0))
+        .unwrap_or_default();
     let user_meta = match msg.from {
         Some(u) => {
             let name = u
                 .username
                 .map(|n| format!("@{}", n))
                 .unwrap_or(u.first_name);
-            format!("[{} | user_id:{} | msg_id:{}] ", name, u.id.0, msg_id)
+            format!(
+                "[{} | user_id:{} | msg_id:{}{}] ",
+                name, u.id.0, msg_id, reply_info
+            )
         }
         None => String::new(),
     };
