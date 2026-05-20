@@ -9,7 +9,7 @@ use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, Message, Update};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -97,6 +97,12 @@ async fn handle_message(
     };
 
     debug!(%chat_id, text_len = text.len(), "received message");
+
+    // TODO: handle non-text content (images, stickers, etc.)
+    if text.trim().is_empty() {
+        warn!(%chat_id, "received non-text or empty message, ignoring");
+        return Ok(());
+    }
 
     host.set_typing(chat_id).await.ok();
 

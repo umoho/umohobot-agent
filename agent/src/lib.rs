@@ -75,8 +75,32 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 thread.messages.clone()
             };
 
-            let prompt = Message::user(user_message);
-            let response = self.agent.chat(prompt, &mut messages).await?;
+            let messages_len = messages.len();
+
+            let response = {
+                let max_attempts = 3;
+                let mut attempt = 0u32;
+                loop {
+                    match self
+                        .agent
+                        .chat(Message::user(user_message), &mut messages)
+                        .await
+                    {
+                        Ok(resp) => break resp,
+                        Err(e) => {
+                            if attempt < max_attempts - 1 && is_rate_limited(&e) {
+                                messages.truncate(messages_len);
+                                let delay =
+                                    std::time::Duration::from_millis(1000 * (attempt as u64 + 1));
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                                continue;
+                            }
+                            return Err(AgentError::ModelError(e));
+                        }
+                    }
+                }
+            };
 
             {
                 let mut threads = self.threads.write().await;
@@ -166,6 +190,7 @@ impl AgentBuilder {
         let client = client_builder.build()?;
 
         let agent = client
+            .completions_api()
             .agent(&self.model)
             .without_preamble()
             .default_max_turns(self.max_turns.unwrap_or(10))
@@ -176,5 +201,21 @@ impl AgentBuilder {
             Arc::new(RwLock::new(HashMap::new())),
             &self.system_prompt,
         ))
+    }
+}
+
+fn is_rate_limited(err: &completion::PromptError) -> bool {
+    match err {
+        completion::PromptError::CompletionError(inner) => match inner {
+            completion::CompletionError::HttpError(http_err) => match http_err {
+                rig_core::http_client::Error::InvalidStatusCode(s) => s.as_u16() == 429,
+                rig_core::http_client::Error::InvalidStatusCodeWithMessage(s, _) => {
+                    s.as_u16() == 429
+                }
+                _ => false,
+            },
+            _ => false,
+        },
+        _ => false,
     }
 }
