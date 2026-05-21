@@ -20,12 +20,41 @@ const SYSTEM_PROMPT: &str = r#"
 
 # 可用工具
 ## Telegram 系列
-- `telegram_sendMessage` — 发送文本消息
+
+### 发送文本和状态
+- `telegram_sendMessage` — 发送文本消息（支持 parseMode 格式化、回复）
 - `telegram_sendChatAction` — 广播聊天状态（typing、upload_photo 等）
-- `telegram_editMessage` / `telegram_deleteMessage` — 编辑/删除消息
-- `telegram_query_message` / `telegram_query_messages` — 查询单条/多条历史消息
-- `telegram_query_search` — 全文搜索
-- `telegram_query_messages_by_user` — 按用户筛选
+- `telegram_sendDice` — 发送骰子/飞镖/篮球等动画（emojis: 🎲/🎯/🎳/🏀/⚽/🎰）
+
+### 发送媒体文件
+所有媒体工具支持 `fileId` 或 `url` 参数指定文件来源。
+- `telegram_sendPhoto` — 发送照片（支持 caption、hasSpoiler、showCaptionAboveMedia）
+- `telegram_sendVideo` — 发送视频（支持 caption、hasSpoiler、showCaptionAboveMedia）
+- `telegram_sendAudio` — 发送音频文件
+- `telegram_sendDocument` — 发送文档
+- `telegram_sendAnimation` — 发送动图/动画（支持 hasSpoiler、showCaptionAboveMedia）
+- `telegram_sendVoice` — 发送语音消息
+- `telegram_sendSticker` — 发送贴纸
+- `telegram_sendMediaGroup` — 一次发送多张照片/视频（媒体组/相册），media 参数传 JSON 数组
+
+### 发送交互
+- `telegram_sendPoll` — 发送投票（支持匿名、多选、计时、每个选项独立格式化）
+
+### 编辑与删除
+- `telegram_editMessage` — 编辑消息文本
+- `telegram_editMessageCaption` — 编辑媒体消息的标题
+- `telegram_editMessageMedia` — 替换消息中的媒体文件（media 传 JSON）
+- `telegram_deleteMessage` — 删除单条消息
+- `telegram_deleteMessages` — 批量删除消息（1–100 条）
+
+### 互动
+- `telegram_setMessageReaction` — 对消息设置表情回应，reaction 传 JSON 数组如 `[{"type":"emoji","emoji":"👍"}]`
+
+### 查询历史（本地缓存，仅限当前会话收到的消息）
+- `telegram_query_message` — 按 ID 查询单条消息
+- `telegram_query_messages` — 列出最近消息（支持分页、limit）
+- `telegram_query_search` — 全文搜索消息
+- `telegram_query_messages_by_user` — 按用户筛选消息
 
 ## Web 系列
 - `web_fetch` — 抓取网页内容为 Markdown 文本
