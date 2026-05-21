@@ -4,6 +4,7 @@ pub use thread::Thread;
 
 pub use rig_core::OneOrMany;
 pub use rig_core::completion::Message;
+pub use rig_core::completion::Usage;
 pub use rig_core::completion::message::{
     DocumentSourceKind, Image, ImageDetail, ImageMediaType, UserContent,
 };
@@ -11,7 +12,7 @@ pub use rig_core::completion::message::{
 use chrono::Utc;
 use rig_core::agent::Agent;
 use rig_core::client::CompletionClient;
-use rig_core::completion::{self, AssistantContent, Chat, CompletionModel};
+use rig_core::completion::{self, AssistantContent, CompletionModel, Prompt};
 use rig_core::providers::openai;
 use std::collections::HashMap;
 use std::future::Future;
@@ -54,10 +55,16 @@ pub trait AgentHandle: Send + Sync {
     fn run_turn<'a>(
         &'a self,
         thread_id: Uuid,
-        user_message: Message,
-    ) -> BoxFuture<'a, Result<String, AgentError>>;
+        messages: Vec<Message>,
+    ) -> BoxFuture<'a, Result<(String, Usage), AgentError>>;
     fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
     fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
+    fn set_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
+    fn compact_thread<'a>(
+        &'a self,
+        thread_id: Uuid,
+        compact_prompt: &'a str,
+    ) -> BoxFuture<'a, Result<String, AgentError>>;
     fn capabilities(&self) -> &[Capability];
 }
 
@@ -85,10 +92,10 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
     fn run_turn<'a>(
         &'a self,
         thread_id: Uuid,
-        user_message: Message,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
+        messages: Vec<Message>,
+    ) -> BoxFuture<'a, Result<(String, Usage), AgentError>> {
         Box::pin(async move {
-            let mut messages = {
+            let mut history = {
                 let threads = self.threads.read().await;
                 let thread = threads
                     .get(&thread_id)
@@ -96,19 +103,39 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 thread.messages.clone()
             };
 
-            let messages_len = messages.len();
+            if messages.is_empty() {
+                return Err(AgentError::ModelError(
+                    completion::PromptError::PromptCancelled {
+                        chat_history: vec![],
+                        reason: "empty batch".into(),
+                    },
+                ));
+            }
 
-            trace!(thread_id = %thread_id, messages = ?messages, "run_turn: messages before chat");
+            let history_len = history.len();
+
+            let (prepend, prompt) = messages.split_at(messages.len() - 1);
+            for msg in prepend {
+                history.push(msg.clone());
+            }
+            let prompt = prompt[0].clone();
+
+            trace!(thread_id = %thread_id, batch_size = messages.len(), "run_turn");
 
             let response = {
                 let max_attempts = 3;
                 let mut attempt = 0u32;
                 loop {
-                    match self.agent.chat(user_message.clone(), &mut messages).await {
+                    match self
+                        .agent
+                        .prompt(prompt.clone())
+                        .with_history(history.clone())
+                        .extended_details()
+                        .await
+                    {
                         Ok(resp) => break resp,
                         Err(e) => {
                             if attempt < max_attempts - 1 && is_rate_limited(&e) {
-                                messages.truncate(messages_len);
                                 let delay =
                                     std::time::Duration::from_millis(1000 * (attempt as u64 + 1));
                                 tokio::time::sleep(delay).await;
@@ -121,21 +148,26 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
                 }
             };
 
-            let reasoning = extract_reasoning(&messages[messages_len..]);
+            if let Some(new_msgs) = response.messages {
+                history.extend(new_msgs);
+            }
+
+            let reasoning = extract_reasoning(&history[history_len..]);
 
             {
                 let mut threads = self.threads.write().await;
                 if let Some(thread) = threads.get_mut(&thread_id) {
-                    thread.messages = messages;
+                    thread.messages = history;
                     thread.last_activity = Utc::now();
                 }
             }
 
-            debug!(thread_id = %thread_id, response_len = response.len(), "run_turn completed");
+            let output = &response.output;
+            debug!(thread_id = %thread_id, response_len = output.len(), "run_turn completed");
             if let Some(r) = &reasoning {
                 trace!(thread_id = %thread_id, reasoning = %r, "run_turn: model reasoning");
             }
-            Ok(response)
+            Ok((response.output, response.usage))
         })
     }
 
@@ -161,6 +193,56 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
             if let Some(thread) = threads.get_mut(&thread_id) {
                 thread.messages.push(Message::system(text));
             }
+        })
+    }
+
+    fn set_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let mut threads = self.threads.write().await;
+            if let Some(thread) = threads.get_mut(&thread_id) {
+                let system_idx = thread
+                    .messages
+                    .iter()
+                    .position(|m| matches!(m, Message::System { .. }));
+                if let Some(idx) = system_idx {
+                    thread.messages[idx] = Message::system(text);
+                } else {
+                    thread.messages.push(Message::system(text));
+                }
+            }
+        })
+    }
+
+    fn compact_thread<'a>(
+        &'a self,
+        thread_id: Uuid,
+        compact_prompt: &'a str,
+    ) -> BoxFuture<'a, Result<String, AgentError>> {
+        Box::pin(async move {
+            let messages = {
+                let threads = self.threads.read().await;
+                let thread = threads
+                    .get(&thread_id)
+                    .ok_or(AgentError::ThreadNotFound(thread_id))?;
+                thread.messages.clone()
+            };
+
+            let conversation_text = messages
+                .iter()
+                .filter_map(|msg| format_message(msg))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let response = self
+                .agent
+                .prompt(Message::User {
+                    content: OneOrMany::one(UserContent::text(conversation_text)),
+                })
+                .with_history(vec![Message::system(compact_prompt)])
+                .extended_details()
+                .await?;
+
+            Ok(response.output)
         })
     }
 
@@ -265,6 +347,44 @@ fn extract_reasoning(messages: &[Message]) -> Option<String> {
         }
     }
     None
+}
+
+fn format_message(msg: &Message) -> Option<String> {
+    match msg {
+        Message::System { content } => Some(format!("System: {content}")),
+        Message::User { content } => {
+            let texts: Vec<String> = content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(format!("User: {}", texts.join(" ")))
+            }
+        }
+        Message::Assistant { content, .. } => {
+            let texts: Vec<String> = content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.clone()),
+                    AssistantContent::Reasoning(r) => Some(r.display_text()),
+                    AssistantContent::ToolCall(tc) => {
+                        Some(format!("[tool_call: {}]", tc.function.name))
+                    }
+                    AssistantContent::Image(_) => None,
+                })
+                .collect();
+            if texts.is_empty() {
+                None
+            } else {
+                Some(format!("Assistant: {}", texts.join(" ")))
+            }
+        }
+    }
 }
 
 fn is_rate_limited(err: &completion::PromptError) -> bool {

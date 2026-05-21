@@ -47,6 +47,9 @@ struct Cli {
 
     #[arg(long, value_delimiter = ',')]
     capabilities: Vec<Capability>,
+
+    #[arg(long)]
+    compact_prompt: Option<String>,
 }
 
 #[tokio::main]
@@ -115,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         idle_timeout: chrono::Duration::seconds(cli.idle_timeout_seconds as i64),
         max_thread_length: cli.max_thread_length,
         system_prompt: cli.system_prompt,
+        compact_prompt: cli.compact_prompt.unwrap_or_default(),
     };
 
     let trigger = TelegramTrigger::new(

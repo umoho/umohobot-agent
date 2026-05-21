@@ -9,7 +9,7 @@ use telegram_host::{MessageCache, TelegramHost};
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, Message as TgMessage, Update};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -137,6 +137,7 @@ pub struct TriggerConfig {
     pub idle_timeout: Duration,
     pub max_thread_length: usize,
     pub system_prompt: String,
+    pub compact_prompt: String,
 }
 
 impl Default for TriggerConfig {
@@ -145,6 +146,12 @@ impl Default for TriggerConfig {
             idle_timeout: Duration::seconds(300),
             max_thread_length: 100,
             system_prompt: "You are a helpful Telegram bot.".into(),
+            compact_prompt:
+                "You are an assistant that extracts key information from conversations. \
+                Summarize important information concisely in Chinese. Include user preferences, \
+                decisions made, ongoing tasks, and important facts. If nothing important, \
+                respond with \"无\"."
+                    .into(),
         }
     }
 }
@@ -166,6 +173,13 @@ impl AlbumBuffer {
     fn new() -> Self {
         Self(Arc::new(Mutex::new(HashMap::new())))
     }
+}
+
+type ChatSenders = Arc<Mutex<HashMap<ChatId, mpsc::UnboundedSender<TgMessage>>>>;
+
+struct ResolveResult {
+    thread_id: Uuid,
+    old_thread_id: Option<Uuid>,
 }
 
 pub struct TelegramTrigger {
@@ -206,11 +220,20 @@ impl TelegramTrigger {
         let host = self.host;
         let buffer = self.buffer;
         let album_buffer = self.album_buffer;
+        let chat_senders: ChatSenders = Arc::new(Mutex::new(HashMap::new()));
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies =
-            dptree::deps![agent, config, chat_map, cache, host, buffer, album_buffer];
+        let dependencies = dptree::deps![
+            agent,
+            config,
+            chat_map,
+            cache,
+            host,
+            buffer,
+            album_buffer,
+            chat_senders
+        ];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -232,6 +255,7 @@ async fn handle_message(
     host: TelegramHost,
     buffer: DataBuffer,
     album_buffer: AlbumBuffer,
+    chat_senders: ChatSenders,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     cache.push(msg.clone()).await;
 
@@ -271,39 +295,128 @@ async fn handle_message(
         return Ok(());
     }
 
-    process_single_message(msg, &host, &buffer, &*agent, &config, &chat_map, &cache).await
+    dispatch_to_worker(
+        msg,
+        chat_senders,
+        agent,
+        config,
+        chat_map,
+        host,
+        buffer,
+        cache,
+    )
+    .await;
+
+    Ok(())
 }
 
-async fn process_single_message(
+async fn dispatch_to_worker(
     msg: TgMessage,
-    host: &TelegramHost,
-    buffer: &DataBuffer,
+    chat_senders: ChatSenders,
+    agent: Arc<dyn AgentHandle>,
+    config: Arc<TriggerConfig>,
+    chat_map: ChatMap,
+    host: TelegramHost,
+    buffer: DataBuffer,
+    cache: MessageCache,
+) {
+    let chat_id = msg.chat.id;
+    let mut map = chat_senders.lock().await;
+
+    if let Some(sender) = map.get(&chat_id) {
+        let _ = sender.send(msg);
+    } else {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(msg);
+        map.insert(chat_id, tx);
+
+        tokio::spawn(chat_worker(
+            chat_id, rx, agent, config, chat_map, host, buffer, cache,
+        ));
+    }
+}
+
+async fn chat_worker(
+    chat_id: ChatId,
+    mut rx: mpsc::UnboundedReceiver<TgMessage>,
+    agent: Arc<dyn AgentHandle>,
+    config: Arc<TriggerConfig>,
+    chat_map: ChatMap,
+    host: TelegramHost,
+    buffer: DataBuffer,
+    _cache: MessageCache,
+) {
+    loop {
+        let Some(first) = rx.recv().await else {
+            return;
+        };
+
+        let mut batch = vec![first];
+        while let Ok(msg) = rx.try_recv() {
+            batch.push(msg);
+        }
+
+        let mut agent_messages = Vec::new();
+        for msg in &batch {
+            let raw_text = msg
+                .text()
+                .or_else(|| msg.caption())
+                .unwrap_or("")
+                .to_owned();
+            match build_user_content(msg, &raw_text, &host, &buffer).await {
+                Ok(content) if !content.is_empty() => {
+                    agent_messages.push(Message::User { content });
+                }
+                _ => warn!(%chat_id, "skipping empty message in batch"),
+            }
+        }
+
+        if agent_messages.is_empty() {
+            continue;
+        }
+
+        let batch_len = agent_messages.len();
+
+        if batch_len > config.max_thread_length as usize {
+            for chunk in agent_messages.chunks(config.max_thread_length) {
+                let resolve =
+                    resolve_thread(chat_id, &chat_map, &*agent, &config, chunk.len()).await;
+                run_compact_and_turn(chat_id, resolve, chunk.to_vec(), &*agent, &config).await;
+            }
+            continue;
+        }
+
+        let resolve = resolve_thread(chat_id, &chat_map, &*agent, &config, batch_len).await;
+        run_compact_and_turn(chat_id, resolve, agent_messages, &*agent, &config).await;
+    }
+}
+
+async fn run_compact_and_turn(
+    chat_id: ChatId,
+    resolve: ResolveResult,
+    agent_messages: Vec<Message>,
     agent: &dyn AgentHandle,
     config: &TriggerConfig,
-    chat_map: &ChatMap,
-    _cache: &MessageCache,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let chat_id = msg.chat.id;
-    let caption = msg.caption();
-    let has_photo = msg.photo().is_some();
-    let has_sticker = msg.sticker().is_some();
-    let raw_text = msg.text().or(caption).unwrap_or("").to_owned();
-
-    debug!(%chat_id, text_len = raw_text.len(), has_photo, has_sticker, "received message");
-
-    let content = build_user_content(&msg, &raw_text, host, buffer).await?;
-
-    if content.is_empty() {
-        warn!(%chat_id, "no content to process");
-        return Ok(());
+) {
+    if let Some(old_id) = resolve.old_thread_id {
+        if let Ok(summary) = agent.compact_thread(old_id, &config.compact_prompt).await {
+            if !summary.is_empty() && summary != "无" {
+                let full_system = format!(
+                    "{}\n\n[上一轮对话摘要]\n{}",
+                    SYSTEM_PROMPT
+                        .replace("{system_prompt}", &config.system_prompt)
+                        .replace("{chat_id}", &chat_id.0.to_string()),
+                    summary
+                );
+                agent
+                    .set_system_message(resolve.thread_id, &full_system)
+                    .await;
+            }
+        }
     }
 
-    let agent_msg = Message::User { content };
-
-    let thread_id = resolve_thread(chat_id, chat_map, agent, config).await;
-
-    match agent.run_turn(thread_id, agent_msg).await {
-        Ok(text) => {
+    match agent.run_turn(resolve.thread_id, agent_messages).await {
+        Ok((text, _usage)) => {
             if !text.is_empty() {
                 debug!(%chat_id, "agent response: {text}");
             }
@@ -312,8 +425,6 @@ async fn process_single_message(
             error!(%chat_id, error = %e, "agent error");
         }
     }
-
-    Ok(())
 }
 
 async fn process_album(
@@ -373,10 +484,27 @@ async fn process_album(
         content: OneOrMany::one(content),
     };
 
-    let thread_id = resolve_thread(chat_id, chat_map, agent, config).await;
+    let resolve = resolve_thread(chat_id, chat_map, agent, config, 1).await;
 
-    match agent.run_turn(thread_id, agent_msg).await {
-        Ok(text) => {
+    if let Some(old_id) = resolve.old_thread_id {
+        if let Ok(summary) = agent.compact_thread(old_id, &config.compact_prompt).await {
+            if !summary.is_empty() && summary != "无" {
+                let full_system = format!(
+                    "{}\n\n[上一轮对话摘要]\n{}",
+                    SYSTEM_PROMPT
+                        .replace("{system_prompt}", &config.system_prompt)
+                        .replace("{chat_id}", &chat_id.0.to_string()),
+                    summary
+                );
+                agent
+                    .set_system_message(resolve.thread_id, &full_system)
+                    .await;
+            }
+        }
+    }
+
+    match agent.run_turn(resolve.thread_id, vec![agent_msg]).await {
+        Ok((text, _usage)) => {
             if !text.is_empty() {
                 debug!(%chat_id, "agent album response: {text}");
             }
@@ -505,16 +633,18 @@ async fn resolve_thread(
     chat_map: &ChatMap,
     agent: &dyn AgentHandle,
     config: &TriggerConfig,
-) -> Uuid {
+    batch_len: usize,
+) -> ResolveResult {
     let mut map = chat_map.write().await;
     let now = Utc::now();
 
     match map.get_mut(&chat_id) {
         Some(entry) => {
             let expired = now - entry.last_activity > config.idle_timeout
-                || entry.message_count >= config.max_thread_length;
+                || entry.message_count + batch_len > config.max_thread_length;
 
             if expired {
+                let old_thread_id = entry.thread_id;
                 let thread_id = Uuid::new_v4();
                 agent.get_or_create_thread(thread_id).await;
                 agent
@@ -528,14 +658,20 @@ async fn resolve_thread(
                 *entry = ThreadEntry {
                     thread_id,
                     last_activity: now,
-                    message_count: 1,
+                    message_count: batch_len,
                 };
                 info!(%chat_id, %thread_id, "new thread (expired)");
-                thread_id
+                ResolveResult {
+                    thread_id,
+                    old_thread_id: Some(old_thread_id),
+                }
             } else {
                 entry.last_activity = now;
-                entry.message_count += 1;
-                entry.thread_id
+                entry.message_count += batch_len;
+                ResolveResult {
+                    thread_id: entry.thread_id,
+                    old_thread_id: None,
+                }
             }
         }
         None => {
@@ -554,11 +690,14 @@ async fn resolve_thread(
                 ThreadEntry {
                     thread_id,
                     last_activity: now,
-                    message_count: 1,
+                    message_count: batch_len,
                 },
             );
             info!(%chat_id, %thread_id, "new thread (first message)");
-            thread_id
+            ResolveResult {
+                thread_id,
+                old_thread_id: None,
+            }
         }
     }
 }
