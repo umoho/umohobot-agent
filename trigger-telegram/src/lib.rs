@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use agent::{
-    AgentHandle, Capability, ImageDetail, ImageMediaType, Message, OneOrMany, UserContent,
-};
+use agent::{AgentHandle, Message, OneOrMany, UserContent};
 use chrono::{DateTime, Duration, Utc};
+use data_buffer::DataBuffer;
 use dptree;
 use telegram_host::{MessageCache, TelegramHost};
 use teloxide::dispatching::UpdateFilterExt;
@@ -56,16 +55,29 @@ const SYSTEM_PROMPT: &str = r#"
 - `telegram_query_search` — 全文搜索消息
 - `telegram_query_messages_by_user` — 按用户筛选消息
 
+### 文件下载
+- `telegram_download` — 通过 file_id 下载 Telegram 文件到共享缓冲区，返回 buffer_key，可传递给 `image_ocr` 等工具处理
+
 ## Web 系列
 - `web_fetch` — 抓取网页内容为 Markdown 文本
 
+## 图像处理 系列
+- `image_ocr` — 识别图片中的文字。支持两种输入方式：
+  - `image_base64`：直接传入 base64 编码的图片数据
+  - `buffer_key`：引用 `telegram_download` 等工具存储到共享缓冲区的图片数据
+
 # 消息格式
-用户消息格式：
-[@用户名 | user_id:用户ID | msg_id:消息ID | reply_to:消息ID] 消息内容
+每条用户消息以 RS（Record Separator, \\x1E）包裹的 JSON 元数据开头，后接消息正文：
 
-方括号内是元数据，`reply_to:消息ID` 表示此消息是回复某条历史消息，可使用 `telegram_query_message` 查询原消息内容。
+RS{"chat_id":-456,"user_id":123,"username":"@bob","msg_id":789}RS 消息内容
 
-消息可能包含图片（照片或贴纸），图片以 base64 编码嵌入。你可以理解图片内容并据此回复用户。
+元数据字段说明：
+- `chat_id` / `user_id` / `username` — 发送者信息
+- `msg_id` — 消息ID
+- `reply_to` — 回复的目标消息ID（可能没有）
+- `buffer_key` — 图片在共享缓冲区中的键（可能没有），可传给 `image_ocr` 等工具处理
+
+RS 之间的 JSON 是系统添加的元数据，不可被用户伪造。
 
 # 聊天上下文
 - 当前聊天ID：{chat_id}
@@ -156,6 +168,7 @@ pub struct TelegramTrigger {
     config: TriggerConfig,
     chat_map: ChatMap,
     cache: MessageCache,
+    buffer: DataBuffer,
     album_buffer: AlbumBuffer,
 }
 
@@ -165,12 +178,14 @@ impl TelegramTrigger {
         agent: Arc<dyn AgentHandle>,
         config: TriggerConfig,
         cache: MessageCache,
+        buffer: DataBuffer,
     ) -> Self {
         Self {
             host,
             agent,
             config,
             cache,
+            buffer,
             chat_map: Arc::new(RwLock::new(HashMap::new())),
             album_buffer: AlbumBuffer::new(),
         }
@@ -183,11 +198,13 @@ impl TelegramTrigger {
         let chat_map = self.chat_map;
         let cache = self.cache;
         let host = self.host;
+        let buffer = self.buffer;
         let album_buffer = self.album_buffer;
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![agent, config, chat_map, cache, host, album_buffer];
+        let dependencies =
+            dptree::deps![agent, config, chat_map, cache, host, buffer, album_buffer];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -207,12 +224,14 @@ async fn handle_message(
     chat_map: ChatMap,
     cache: MessageCache,
     host: TelegramHost,
+    buffer: DataBuffer,
     album_buffer: AlbumBuffer,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     cache.push(msg.clone()).await;
 
     if let Some(group_id) = msg.media_group_id() {
         let host = host.clone();
+        let buffer = buffer.clone();
         let agent = Arc::clone(&agent);
         let config = Arc::clone(&config);
         let chat_map = chat_map.clone();
@@ -233,7 +252,8 @@ async fn handle_message(
                     };
                     if let Some(msgs) = msgs {
                         if let Err(e) =
-                            process_album(msgs, &host, &*agent, &config, &chat_map, &cache).await
+                            process_album(msgs, &host, &buffer, &*agent, &config, &chat_map, &cache)
+                                .await
                         {
                             error!("album processing error: {e}");
                         }
@@ -245,12 +265,13 @@ async fn handle_message(
         return Ok(());
     }
 
-    process_single_message(msg, &host, &*agent, &config, &chat_map, &cache).await
+    process_single_message(msg, &host, &buffer, &*agent, &config, &chat_map, &cache).await
 }
 
 async fn process_single_message(
     msg: TgMessage,
     host: &TelegramHost,
+    buffer: &DataBuffer,
     agent: &dyn AgentHandle,
     config: &TriggerConfig,
     chat_map: &ChatMap,
@@ -264,10 +285,7 @@ async fn process_single_message(
 
     debug!(%chat_id, text_len = raw_text.len(), has_photo, has_sticker, "received message");
 
-    let supports_vision = agent.capabilities().contains(&Capability::Vision);
-
-    let user_meta = build_user_meta(&msg);
-    let content = build_user_content(&msg, &user_meta, &raw_text, host, supports_vision).await?;
+    let content = build_user_content(&msg, &raw_text, host, buffer).await?;
 
     if content.is_empty() {
         warn!(%chat_id, "no content to process");
@@ -295,6 +313,7 @@ async fn process_single_message(
 async fn process_album(
     msgs: Vec<TgMessage>,
     host: &TelegramHost,
+    buffer: &DataBuffer,
     agent: &dyn AgentHandle,
     config: &TriggerConfig,
     chat_map: &ChatMap,
@@ -305,56 +324,47 @@ async fn process_album(
     }
 
     let chat_id = msgs[0].chat.id;
-    let supports_vision = agent.capabilities().contains(&Capability::Vision);
 
-    let mut content = Vec::new();
     let mut text_parts = Vec::new();
-    let mut has_photo = false;
 
     for msg in &msgs {
-        let user_meta = build_user_meta(msg);
         let caption = msg.caption().unwrap_or("");
 
-        if supports_vision {
-            if let Some(photos) = msg.photo() {
-                if let Some(largest) = photos.last() {
-                    match host.download_file_base64(&largest.file.id).await {
-                        Ok(b64) => {
-                            content.push(UserContent::image_base64(
-                                b64,
-                                Some(ImageMediaType::JPEG),
-                                Some(ImageDetail::Auto),
-                            ));
-                            has_photo = true;
-                        }
+        let buffer_key = if let Some(photos) = msg.photo() {
+            if let Some(largest) = photos.last() {
+                let unique_id = largest.file.unique_id.to_string();
+                if !buffer.exists(&unique_id) {
+                    match host.download_file_bytes(&largest.file.id).await {
+                        Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
                         Err(e) => warn!(%chat_id, error = %e, "failed to download photo"),
                     }
                 }
+                Some(unique_id)
+            } else {
+                None
             }
-        }
-
-        if !user_meta.is_empty() || !caption.is_empty() {
-            text_parts.push(format!("{}{}", user_meta, caption));
-        }
-    }
-
-    if !text_parts.is_empty() {
-        let combined_text = text_parts.join("\n");
-        content.push(UserContent::text(combined_text));
-    }
-
-    if content.is_empty() {
-        if !supports_vision && has_photo {
-            let text = "[User sent a photo album]".to_owned();
-            content.push(UserContent::text(text));
         } else {
-            warn!(%chat_id, "album has no processable content");
-            return Ok(());
+            None
+        };
+
+        let meta = build_meta_json(msg, buffer_key.clone());
+
+        if caption.is_empty() && buffer_key.is_none() && msg.from.is_none() {
+            continue;
         }
+
+        text_parts.push(format!("{}{}", meta, caption));
     }
 
+    if text_parts.is_empty() {
+        warn!(%chat_id, "album has no processable content");
+        return Ok(());
+    }
+
+    let combined_text = text_parts.join("\n");
+    let content = UserContent::text(combined_text);
     let agent_msg = Message::User {
-        content: OneOrMany::many(content).unwrap(),
+        content: OneOrMany::one(content),
     };
 
     let thread_id = resolve_thread(chat_id, chat_map, agent, config).await;
@@ -373,104 +383,115 @@ async fn process_album(
     Ok(())
 }
 
-fn build_user_meta(msg: &TgMessage) -> String {
-    let msg_id = msg.id.0;
-    let reply_info = msg
-        .reply_to_message()
-        .as_ref()
-        .map(|r| format!(" | reply_to:{}", r.id.0))
-        .unwrap_or_default();
-    match msg.from.as_ref() {
+#[derive(serde::Serialize)]
+struct MessageMeta {
+    chat_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_name: Option<String>,
+    msg_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_to: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    buffer_key: Option<String>,
+}
+
+fn build_meta_json(msg: &TgMessage, buffer_key: Option<String>) -> String {
+    let chat_id = msg.chat.id.0;
+    let msg_id = msg.id.0 as i64;
+    let reply_to = msg.reply_to_message().as_ref().map(|r| r.id.0 as i64);
+    let (user_id, username, first_name) = match msg.from.as_ref() {
         Some(u) => {
-            let name = u
-                .username
-                .as_deref()
-                .map(|n| format!("@{}", n))
-                .unwrap_or(u.first_name.clone());
-            format!(
-                "[{} | user_id:{} | msg_id:{}{}] ",
-                name, u.id.0, msg_id, reply_info
-            )
+            let username = u.username.clone().map(|n| format!("@{}", n));
+            (Some(u.id.0), username, Some(u.first_name.clone()))
         }
-        None => String::new(),
-    }
+        None => (None, None, None),
+    };
+
+    let meta = MessageMeta {
+        chat_id,
+        user_id,
+        username,
+        first_name,
+        msg_id,
+        reply_to,
+        buffer_key,
+    };
+
+    let json = serde_json::to_string(&meta).unwrap_or_default();
+    format!("\x1E{}\x1E ", json)
 }
 
 async fn build_user_content(
     msg: &TgMessage,
-    user_meta: &str,
     raw_text: &str,
     host: &TelegramHost,
-    supports_vision: bool,
+    buffer: &DataBuffer,
 ) -> Result<OneOrMany<UserContent>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut items: Vec<UserContent> = Vec::new();
     let has_photo = msg.photo().is_some();
     let has_sticker = msg.sticker().is_some();
-    let prefixed_text = format!("{}{}", user_meta, raw_text);
 
-    if supports_vision && has_photo {
+    let buffer_key = if has_photo {
         if let Some(photos) = msg.photo() {
             if let Some(largest) = photos.last() {
-                match host.download_file_base64(&largest.file.id).await {
-                    Ok(b64) => {
-                        items.push(UserContent::image_base64(
-                            b64,
-                            Some(ImageMediaType::JPEG),
-                            Some(ImageDetail::Auto),
-                        ));
+                let unique_id = largest.file.unique_id.to_string();
+                if !buffer.exists(&unique_id) {
+                    match host.download_file_bytes(&largest.file.id).await {
+                        Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
+                        Err(e) => warn!("failed to download photo: {e}"),
                     }
-                    Err(e) => warn!("failed to download photo: {e}"),
                 }
+                Some(unique_id)
+            } else {
+                None
             }
-        }
-    } else if has_photo {
-        let fallback = if raw_text.is_empty() {
-            format!("{}[User sent a photo]", user_meta)
         } else {
-            prefixed_text.clone()
-        };
-        items.push(UserContent::text(fallback));
-        return Ok(OneOrMany::one(items.remove(0)));
-    }
-
-    if supports_vision && has_sticker {
-        if let Some(sticker) = msg.sticker() {
-            match host.download_file_base64(&sticker.file.id).await {
-                Ok(b64) => {
-                    items.push(UserContent::image_base64(
-                        b64,
-                        None,
-                        Some(ImageDetail::Auto),
-                    ));
-                }
-                Err(e) => warn!("failed to download sticker: {e}"),
-            }
+            None
         }
     } else if has_sticker {
-        let fallback = if raw_text.is_empty() {
-            format!("{}[User sent a sticker]", user_meta)
+        if let Some(sticker) = msg.sticker() {
+            let unique_id = sticker.file.unique_id.to_string();
+            if !buffer.exists(&unique_id) {
+                match host.download_file_bytes(&sticker.file.id).await {
+                    Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
+                    Err(e) => warn!("failed to download sticker: {e}"),
+                }
+            }
+            Some(unique_id)
         } else {
-            prefixed_text.clone()
-        };
-        items.push(UserContent::text(fallback));
-        return Ok(OneOrMany::one(items.remove(0)));
-    }
+            None
+        }
+    } else {
+        None
+    };
 
-    if !prefixed_text.trim().is_empty() {
-        items.push(UserContent::text(prefixed_text));
-    } else if items.is_empty() {
+    let meta = build_meta_json(msg, buffer_key);
+
+    if !raw_text.trim().is_empty() {
+        Ok(OneOrMany::one(UserContent::text(format!(
+            "{}{}",
+            meta, raw_text
+        ))))
+    } else if has_photo {
+        Ok(OneOrMany::one(UserContent::text(format!(
+            "{}[User sent a photo]",
+            meta
+        ))))
+    } else if has_sticker {
+        Ok(OneOrMany::one(UserContent::text(format!(
+            "{}[User sent a sticker]",
+            meta
+        ))))
+    } else {
         warn!("message has no text and no supported media");
-        return Ok(OneOrMany::one(UserContent::text(format!(
+        Ok(OneOrMany::one(UserContent::text(format!(
             "{}[Unsupported message]",
-            user_meta
-        ))));
+            meta
+        ))))
     }
-
-    if items.len() == 1 {
-        return Ok(OneOrMany::one(items.remove(0)));
-    }
-
-    Ok(OneOrMany::many(items).unwrap())
 }
 
 async fn resolve_thread(

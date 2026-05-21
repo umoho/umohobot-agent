@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
 
     let data_buffer = DataBuffer::new();
+    let trigger_buffer = data_buffer.clone();
     let ocr_backend = Box::new(OcrsBackend::new().await?);
     agent_runtime
         .agent()
@@ -116,7 +117,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         system_prompt: cli.system_prompt,
     };
 
-    let trigger = TelegramTrigger::new(telegram_host, Arc::new(agent_runtime), config, cache);
+    let trigger = TelegramTrigger::new(
+        telegram_host,
+        Arc::new(agent_runtime),
+        config,
+        cache,
+        trigger_buffer,
+    );
 
     trigger.start().await
 }

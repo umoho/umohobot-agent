@@ -23,6 +23,14 @@ impl DataBuffer {
         key
     }
 
+    pub fn store_with_key(&self, key: String, data: Vec<u8>) {
+        self.inner.insert(key, data);
+    }
+
+    pub fn exists(&self, key: &str) -> bool {
+        self.inner.contains_key(key)
+    }
+
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.inner.get(key)
     }

@@ -50,6 +50,16 @@ impl TelegramHost {
         Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
     }
 
+    pub async fn download_file_bytes(
+        &self,
+        file_id: &FileId,
+    ) -> Result<(Vec<u8>, String), TelegramError> {
+        let file = self.bot.get_file(file_id.clone()).await?;
+        let url = format!("{}file/bot{}/{}", self.bot.api_url(), self.token, file.path);
+        let bytes = self.bot.client().get(&url).send().await?.bytes().await?;
+        Ok((bytes.to_vec(), file.unique_id.to_string()))
+    }
+
     pub async fn send_message(
         &self,
         chat_id: ChatId,
