@@ -18,6 +18,7 @@ toml = "0.8"
 dptree = "0.5"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
 
 [package]
 name = "umohobot"
