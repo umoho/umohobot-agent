@@ -1,7 +1,9 @@
+mod download;
 mod edit;
 mod query;
 mod send;
 
+pub use download::*;
 pub use edit::*;
 pub use query::*;
 pub use send::*;
