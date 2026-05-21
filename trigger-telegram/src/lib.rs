@@ -248,16 +248,16 @@ async fn process_album(
         if supports_vision {
             if let Some(photos) = msg.photo() {
                 if let Some(largest) = photos.last() {
-                    match host.get_file_url(&largest.file.id).await {
-                        Ok(url) => {
-                            content.push(UserContent::image_url(
-                                url,
+                    match host.download_file_base64(&largest.file.id).await {
+                        Ok(b64) => {
+                            content.push(UserContent::image_base64(
+                                b64,
                                 Some(ImageMediaType::JPEG),
                                 Some(ImageDetail::Auto),
                             ));
                             has_photo = true;
                         }
-                        Err(e) => warn!(%chat_id, error = %e, "failed to get photo URL"),
+                        Err(e) => warn!(%chat_id, error = %e, "failed to download photo"),
                     }
                 }
             }
@@ -341,15 +341,15 @@ async fn build_user_content(
     if supports_vision && has_photo {
         if let Some(photos) = msg.photo() {
             if let Some(largest) = photos.last() {
-                match host.get_file_url(&largest.file.id).await {
-                    Ok(url) => {
-                        items.push(UserContent::image_url(
-                            url,
+                match host.download_file_base64(&largest.file.id).await {
+                    Ok(b64) => {
+                        items.push(UserContent::image_base64(
+                            b64,
                             Some(ImageMediaType::JPEG),
                             Some(ImageDetail::Auto),
                         ));
                     }
-                    Err(e) => warn!("failed to get photo URL: {e}"),
+                    Err(e) => warn!("failed to download photo: {e}"),
                 }
             }
         }
@@ -365,11 +365,15 @@ async fn build_user_content(
 
     if supports_vision && has_sticker {
         if let Some(sticker) = msg.sticker() {
-            match host.get_file_url(&sticker.file.id).await {
-                Ok(url) => {
-                    items.push(UserContent::image_url(url, None, Some(ImageDetail::Auto)));
+            match host.download_file_base64(&sticker.file.id).await {
+                Ok(b64) => {
+                    items.push(UserContent::image_base64(
+                        b64,
+                        None,
+                        Some(ImageDetail::Auto),
+                    ));
                 }
-                Err(e) => warn!("failed to get sticker URL: {e}"),
+                Err(e) => warn!("failed to download sticker: {e}"),
             }
         }
     } else if has_sticker {

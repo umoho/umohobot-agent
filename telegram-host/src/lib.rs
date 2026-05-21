@@ -11,6 +11,8 @@ use tracing::debug;
 pub enum TelegramError {
     #[error("Telegram API error: {0}")]
     Api(#[from] teloxide::RequestError),
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
 }
 
 #[derive(Clone)]
@@ -40,14 +42,12 @@ impl TelegramHost {
         &self.token
     }
 
-    pub async fn get_file_url(&self, file_id: &FileId) -> Result<String, TelegramError> {
+    pub async fn download_file_base64(&self, file_id: &FileId) -> Result<String, TelegramError> {
         let file = self.bot.get_file(file_id.clone()).await?;
-        Ok(format!(
-            "{}file/bot{}/{}",
-            self.bot.api_url(),
-            self.token,
-            file.path,
-        ))
+        let url = format!("{}file/bot{}/{}", self.bot.api_url(), self.token, file.path);
+        let bytes = self.bot.client().get(&url).send().await?.bytes().await?;
+        use base64::Engine as _;
+        Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
     }
 
     pub async fn send_message(
