@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "agent", "tools-telegram", "tools-web", "trigger-telegram", "telegram-host"]
+members = [".", "agent", "data-buffer", "tools-image", "tools-telegram", "tools-web", "trigger-telegram", "telegram-host"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -28,6 +28,8 @@ edition = "2024"
 [dependencies]
 agent = { path = "agent" }
 trigger-telegram = { path = "trigger-telegram" }
+data-buffer = { path = "data-buffer" }
+tools-image = { path = "tools-image", features = ["ocr-backend-ocrs"] }
 tools-telegram = { path = "tools-telegram" }
 tools-web = { path = "tools-web" }
 telegram-host = { path = "telegram-host" }

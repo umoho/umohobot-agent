@@ -1,0 +1,20 @@
+[package]
+name = "tools-image"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+ocr-backend-ocrs = ["dep:ocrs", "dep:image", "dep:reqwest", "dep:rten"]
+
+[dependencies]
+rig-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+data-buffer = { path = "../data-buffer" }
+
+ocrs = { version = "0.12", optional = true }
+image = { version = "0.25", optional = true }
+rten = { version = "0.24", optional = true }
+reqwest = { workspace = true, optional = true }

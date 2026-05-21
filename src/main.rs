@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use agent::{AgentBuilder, Capability};
+use data_buffer::DataBuffer;
 use telegram_host::{MessageCache, TelegramHost};
+use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
 use tools_telegram::register_telegram_tools;
 use tools_web::WebFetchTool;
 use tracing::info;
@@ -89,6 +91,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .agent()
         .tool_server_handle
         .add_tool(WebFetchTool)
+        .await?;
+
+    let data_buffer = DataBuffer::new();
+    let ocr_backend = Box::new(OcrsBackend::new().await?);
+    agent_runtime
+        .agent()
+        .tool_server_handle
+        .add_tool(ImageOcrTool::new(ocr_backend, data_buffer))
         .await?;
 
     let config = TriggerConfig {
