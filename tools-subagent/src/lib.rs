@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent::{AgentError, AgentRuntime};
+use agent::{AgentError, AgentRuntime, SubagentStatus};
 use rig_core::completion::CompletionModel;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
@@ -80,9 +80,14 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
     }
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
-        self.agent
+        let created = self
+            .agent
             .subagent_create(&args.name, args.system_prompt.as_deref(), &args.tools)
-            .await
+            .await?;
+        Ok(format!(
+            "subagent '{}' created, token={}",
+            created.name, created.token
+        ))
     }
 }
 
@@ -125,7 +130,8 @@ impl<M: CompletionModel + 'static> Tool for SubagentAskTool<M> {
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
         self.agent
             .subagent_ask(&args.token, &args.name, &args.task)
-            .await
+            .await?;
+        Ok(format!("task submitted to subagent '{}'", args.name))
     }
 }
 
@@ -162,7 +168,8 @@ impl<M: CompletionModel + 'static> Tool for SubagentStopTool<M> {
     }
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
-        self.agent.subagent_stop(&args.token, &args.name).await
+        self.agent.subagent_stop(&args.token, &args.name).await?;
+        Ok(format!("subagent '{}' stopped", args.name))
     }
 }
 
@@ -201,7 +208,15 @@ impl<M: CompletionModel + 'static> Tool for SubagentStatusTool<M> {
     }
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
-        self.agent.subagent_status(&args.token, &args.name).await
+        let status = self.agent.subagent_status(&args.token, &args.name).await?;
+        let s = match status {
+            SubagentStatus::Idle => "idle".into(),
+            SubagentStatus::Running => "running".into(),
+            SubagentStatus::Completed(available) => {
+                format!("completed ({available} available)")
+            }
+        };
+        Ok(s)
     }
 }
 
@@ -281,7 +296,8 @@ impl<M: CompletionModel + 'static> Tool for SubagentDestroyTool<M> {
     }
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
-        self.agent.subagent_destroy(&args.token, &args.name).await
+        self.agent.subagent_destroy(&args.token, &args.name).await?;
+        Ok(format!("subagent '{}' destroyed", args.name))
     }
 }
 
