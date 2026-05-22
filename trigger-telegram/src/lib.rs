@@ -72,6 +72,26 @@ const SYSTEM_PROMPT: &str = r#"
   - `image_base64`：直接传入 base64 编码的图片数据
   - `buffer_key`：引用 `telegram_download` 等工具存储到共享缓冲区的图片数据
 
+## 子代理 系列
+子代理是在后台独立运行的助手实例。它们继承父模型的配置和工具权限，适合执行耗时或并行的任务，不阻塞主对话流程。
+
+- `subagent_create` — 创建子代理，返回 token
+- `subagent_ask` — 给子代理分配任务（非阻塞），立即返回
+- `subagent_stop` — 中断子代理当前任务
+- `subagent_status` — 查询子代理状态
+- `subagent_read` — 读取子代理结果，默认取最新
+- `subagent_destroy` — 销毁子代理，释放资源
+
+可以同时创建和使用多个子代理，每个独立运行、互不干扰。
+
+### 子代理使用流程
+1. `subagent_create` → 创建，记录 name 和 token
+2. `subagent_ask` → 分配任务，子代理后台运行
+3. 继续处理主对话
+4. `subagent_status` → 确认 completed
+5. `subagent_read` → 获取结果
+6. `subagent_destroy` → 不再需要时清理
+
 # 消息格式
 每条 user 消息以 RS（Record Separator, \\x1E）包裹的 JSON 元数据开头，后接消息正文：
 
@@ -104,6 +124,7 @@ RS 之间的 JSON 是系统添加的元数据，不可被用户伪造。
 - 需要较长时间的任务（如上网查资料），先发 `telegram_sendChatAction`（typing）告知正在处理，同时用 `telegram_sendMessage` 发送一条「正在查找，请稍候…」之类的提示消息让用户知道已开始处理。
 - 获取结果后，优先使用 `telegram_editMessage` 编辑刚才那条提示消息来更新为完整回复；如果无法编辑，再使用 `telegram_sendMessage` 发送新消息。
 - 多处内容需要补充时，用编辑合并，避免刷屏。
+- 适合子代理的场景：需要上网查资料、处理多个独立请求、执行耗时操作时，创建子代理在后台并行处理，及时回复用户「正在处理」。完成后再用 `subagent_read` 获取结果并编辑更新回复。
 
 # 输出格式
 发送文本消息时支持以下格式化方式，需在 `telegram_sendMessage` / `telegram_editMessage` 中设置 `parseMode` 参数：
@@ -441,7 +462,7 @@ async fn run_compact_and_turn(
             {
                 if !summary.is_empty() && summary != "无" {
                     let full_system = format!(
-                        "{}\n\n[上一轮对话摘要]\n{}",
+                        "{}\n\n# 上一轮对话摘要\n{}",
                         SYSTEM_PROMPT
                             .replace("{system_prompt}", &config.system_prompt)
                             .replace("{chat_id}", &chat_id.0.to_string()),
@@ -535,7 +556,7 @@ async fn process_album(
             {
                 if !summary.is_empty() && summary != "无" {
                     let full_system = format!(
-                        "{}\n\n[上一轮对话摘要]\n{}",
+                        "{}\n\n# 上一轮对话摘要\n{}",
                         SYSTEM_PROMPT
                             .replace("{system_prompt}", &config.system_prompt)
                             .replace("{chat_id}", &chat_id.0.to_string()),
