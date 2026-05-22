@@ -1,6 +1,5 @@
 use chrono::Utc;
 use rig_core::agent::Agent;
-use rig_core::completion::message::UserContent;
 use rig_core::completion::{self, AssistantContent, CompletionModel, Message, Prompt, Usage};
 use tracing::{debug, trace};
 use uuid::Uuid;
@@ -101,44 +100,6 @@ fn extract_reasoning(messages: &[Message]) -> Option<String> {
         }
     }
     None
-}
-
-pub(crate) fn format_message(msg: &Message) -> Option<String> {
-    match msg {
-        Message::System { content } => Some(format!("System: {content}")),
-        Message::User { content } => {
-            let texts: Vec<String> = content
-                .iter()
-                .filter_map(|c| match c {
-                    UserContent::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(format!("User: {}", texts.join(" ")))
-            }
-        }
-        Message::Assistant { content, .. } => {
-            let texts: Vec<String> = content
-                .iter()
-                .filter_map(|c| match c {
-                    AssistantContent::Text(t) => Some(t.text.clone()),
-                    AssistantContent::Reasoning(r) => Some(r.display_text()),
-                    AssistantContent::ToolCall(tc) => {
-                        Some(format!("[tool_call: {}]", tc.function.name))
-                    }
-                    AssistantContent::Image(_) => None,
-                })
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(format!("Assistant: {}", texts.join(" ")))
-            }
-        }
-    }
 }
 
 fn is_rate_limited(err: &completion::PromptError) -> bool {

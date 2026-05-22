@@ -20,6 +20,7 @@ pub use thread::Thread;
 pub use types::{CreatedSubagent, ModelConfig, SubagentEntry, SubagentStatus};
 
 pub use rig_core::OneOrMany;
+pub use rig_core::completion::AssistantContent;
 pub use rig_core::completion::CompletionModel;
 pub use rig_core::completion::Message;
 pub use rig_core::completion::ToolDefinition;

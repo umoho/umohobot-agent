@@ -14,6 +14,8 @@ use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+mod compact_format;
+
 const SYSTEM_PROMPT: &str = r#"
 你是 Agent，一个运行在 Telegram 聊天中的机器人成员。你使用软件工具与聊天中的其他成员通讯——就像人类使用聊天软件一样，你通过「工具」完成收发消息等操作。
 
@@ -130,6 +132,43 @@ RS 之间的 JSON 是系统添加的元数据，不可被用户伪造。
 {system_prompt}
 "#;
 
+const COMPACT_PROMPT: &str = r#"
+你是对话分析师，负责在群聊/私聊会话切换时继承上下文。
+
+对话中每行的格式：
+- "User: RS{"user_id":...,"username":...}RS 消息正文" — 用户消息，RS间的JSON包含元数据
+- "Assistant: 助手通过工具发出的内容" — 助手实际发送的消息（如 text、fetched URL 等）
+
+基于以下完整对话内容，提取本聊天的结构化特征摘要。
+如果无有效内容，输出：无
+
+否则按以下模板输出：
+
+## 聊天风格
+(正式/随意/技术向/娱乐向 等整体风格)
+
+## 活跃用户
+(每个用户的个性、偏好、语言习惯、特殊要求)
+
+## 常见话题
+(本群经常讨论的主题)
+
+## 发言记录
+(讨论了什么话题、助手发送了哪些消息)
+
+## 浏览记录
+(访问了哪些网页、获取了哪些外部信息)
+
+## 当前氛围
+(最近消息的活跃度、情绪基调)
+
+## 上下文
+(对后续对话重要的背景信息、未完结的互动)
+
+## 注意事项
+(需要避免的话题、用户明确表达的不喜欢的内容)
+"#;
+
 const ALBUM_TIMEOUT_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
@@ -146,12 +185,7 @@ impl Default for TriggerConfig {
             idle_timeout: Duration::seconds(300),
             max_thread_length: 100,
             system_prompt: "You are a helpful Telegram bot.".into(),
-            compact_prompt:
-                "You are an assistant that extracts key information from conversations. \
-                Summarize important information concisely in Chinese. Include user preferences, \
-                decisions made, ongoing tasks, and important facts. If nothing important, \
-                respond with \"无\"."
-                    .into(),
+            compact_prompt: COMPACT_PROMPT.into(),
         }
     }
 }
@@ -399,21 +433,24 @@ async fn run_compact_and_turn(
     config: &TriggerConfig,
 ) {
     if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(summary) = agent
-            .compact_thread(old_id, resolve.thread_id, &config.compact_prompt)
-            .await
-        {
-            if !summary.is_empty() && summary != "无" {
-                let full_system = format!(
-                    "{}\n\n[上一轮对话摘要]\n{}",
-                    SYSTEM_PROMPT
-                        .replace("{system_prompt}", &config.system_prompt)
-                        .replace("{chat_id}", &chat_id.0.to_string()),
-                    summary
-                );
-                agent
-                    .set_system_message(resolve.thread_id, &full_system)
-                    .await;
+        if let Ok(msgs) = agent.get_thread_messages(old_id).await {
+            let text = compact_format::format_for_compact(&msgs);
+            if let Ok(summary) = agent
+                .compact_thread(&text, old_id, resolve.thread_id, &config.compact_prompt)
+                .await
+            {
+                if !summary.is_empty() && summary != "无" {
+                    let full_system = format!(
+                        "{}\n\n[上一轮对话摘要]\n{}",
+                        SYSTEM_PROMPT
+                            .replace("{system_prompt}", &config.system_prompt)
+                            .replace("{chat_id}", &chat_id.0.to_string()),
+                        summary
+                    );
+                    agent
+                        .set_system_message(resolve.thread_id, &full_system)
+                        .await;
+                }
             }
         }
     }
@@ -490,21 +527,24 @@ async fn process_album(
     let resolve = resolve_thread(chat_id, chat_map, agent, config, 1).await;
 
     if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(summary) = agent
-            .compact_thread(old_id, resolve.thread_id, &config.compact_prompt)
-            .await
-        {
-            if !summary.is_empty() && summary != "无" {
-                let full_system = format!(
-                    "{}\n\n[上一轮对话摘要]\n{}",
-                    SYSTEM_PROMPT
-                        .replace("{system_prompt}", &config.system_prompt)
-                        .replace("{chat_id}", &chat_id.0.to_string()),
-                    summary
-                );
-                agent
-                    .set_system_message(resolve.thread_id, &full_system)
-                    .await;
+        if let Ok(msgs) = agent.get_thread_messages(old_id).await {
+            let text = compact_format::format_for_compact(&msgs);
+            if let Ok(summary) = agent
+                .compact_thread(&text, old_id, resolve.thread_id, &config.compact_prompt)
+                .await
+            {
+                if !summary.is_empty() && summary != "无" {
+                    let full_system = format!(
+                        "{}\n\n[上一轮对话摘要]\n{}",
+                        SYSTEM_PROMPT
+                            .replace("{system_prompt}", &config.system_prompt)
+                            .replace("{chat_id}", &chat_id.0.to_string()),
+                        summary
+                    );
+                    agent
+                        .set_system_message(resolve.thread_id, &full_system)
+                        .await;
+                }
             }
         }
     }

@@ -6,7 +6,7 @@ use rig_core::completion::{CompletionModel, Message, Prompt};
 
 use crate::capability::Capability;
 use crate::error::AgentError;
-use crate::run_turn::{format_message, run_turn_inner};
+use crate::run_turn::run_turn_inner;
 use crate::runtime::AgentRuntime;
 use crate::thread::Thread;
 use crate::{BoxFuture, CURRENT_PARENT_THREAD_ID, Usage};
@@ -20,8 +20,13 @@ pub trait AgentHandle: Send + Sync {
     fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
     fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
     fn set_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
+    fn get_thread_messages<'a>(
+        &'a self,
+        thread_id: Uuid,
+    ) -> BoxFuture<'a, Result<Vec<Message>, AgentError>>;
     fn compact_thread<'a>(
         &'a self,
+        formatted_text: &'a str,
         old_thread_id: Uuid,
         new_thread_id: Uuid,
         compact_prompt: &'a str,
@@ -87,31 +92,31 @@ impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
         })
     }
 
+    fn get_thread_messages<'a>(
+        &'a self,
+        thread_id: Uuid,
+    ) -> BoxFuture<'a, Result<Vec<Message>, AgentError>> {
+        Box::pin(async move {
+            let threads = self.threads.read().await;
+            let thread = threads
+                .get(&thread_id)
+                .ok_or(AgentError::ThreadNotFound(thread_id))?;
+            Ok(thread.messages.clone())
+        })
+    }
+
     fn compact_thread<'a>(
         &'a self,
+        formatted_text: &'a str,
         old_thread_id: Uuid,
         new_thread_id: Uuid,
         compact_prompt: &'a str,
     ) -> BoxFuture<'a, Result<String, AgentError>> {
         Box::pin(async move {
-            let messages = {
-                let threads = self.threads.read().await;
-                let thread = threads
-                    .get(&old_thread_id)
-                    .ok_or(AgentError::ThreadNotFound(old_thread_id))?;
-                thread.messages.clone()
-            };
-
-            let conversation_text = messages
-                .iter()
-                .filter_map(|msg| format_message(msg))
-                .collect::<Vec<_>>()
-                .join("\n");
-
             let response = self
                 .agent
                 .prompt(Message::User {
-                    content: OneOrMany::one(UserContent::text(conversation_text)),
+                    content: OneOrMany::one(UserContent::text(formatted_text.to_string())),
                 })
                 .with_history(vec![Message::system(compact_prompt)])
                 .extended_details()
