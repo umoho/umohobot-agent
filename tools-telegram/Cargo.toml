@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agent = { path = "../agent" }
 rig-core = { workspace = true }
 telegram-host = { path = "../telegram-host" }
 teloxide = { workspace = true }

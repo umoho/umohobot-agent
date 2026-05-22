@@ -399,7 +399,10 @@ async fn run_compact_and_turn(
     config: &TriggerConfig,
 ) {
     if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(summary) = agent.compact_thread(old_id, &config.compact_prompt).await {
+        if let Ok(summary) = agent
+            .compact_thread(old_id, resolve.thread_id, &config.compact_prompt)
+            .await
+        {
             if !summary.is_empty() && summary != "无" {
                 let full_system = format!(
                     "{}\n\n[上一轮对话摘要]\n{}",
@@ -487,7 +490,10 @@ async fn process_album(
     let resolve = resolve_thread(chat_id, chat_map, agent, config, 1).await;
 
     if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(summary) = agent.compact_thread(old_id, &config.compact_prompt).await {
+        if let Ok(summary) = agent
+            .compact_thread(old_id, resolve.thread_id, &config.compact_prompt)
+            .await
+        {
             if !summary.is_empty() && summary != "无" {
                 let full_system = format!(
                     "{}\n\n[上一轮对话摘要]\n{}",

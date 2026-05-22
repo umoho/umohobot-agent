@@ -1,7 +1,7 @@
 use crate::{ToolError, build_input_file};
+use agent::{AgentError, AgentRuntime, CompletionModel};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
-use rig_core::tool::server::ToolServerHandle;
 use serde::Deserialize;
 use serde_json::json;
 use telegram_host::TelegramHost;
@@ -457,25 +457,27 @@ impl Tool for SetMessageReactionTool {
     }
 }
 
-pub async fn register_edit_tools(
-    handle: &ToolServerHandle,
+pub async fn register_edit_tools<M: CompletionModel + 'static>(
+    runtime: &AgentRuntime<M>,
     host: TelegramHost,
-) -> Result<(), rig_core::tool::server::ToolServerError> {
-    handle
-        .add_tool(EditMessageTool { host: host.clone() })
+) -> Result<(), AgentError> {
+    runtime
+        .register_tool(EditMessageTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(DeleteMessageTool { host: host.clone() })
+    runtime
+        .register_tool(DeleteMessageTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(DeleteMessagesTool { host: host.clone() })
+    runtime
+        .register_tool(DeleteMessagesTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(EditMessageCaptionTool { host: host.clone() })
+    runtime
+        .register_tool(EditMessageCaptionTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(EditMessageMediaTool { host: host.clone() })
+    runtime
+        .register_tool(EditMessageMediaTool { host: host.clone() })
         .await?;
-    handle.add_tool(SetMessageReactionTool { host }).await?;
+    runtime
+        .register_tool(SetMessageReactionTool { host })
+        .await?;
     Ok(())
 }

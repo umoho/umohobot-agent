@@ -8,6 +8,10 @@ pub struct Thread {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
+    pub closed: bool,
+    pub prev_thread_id: Option<Uuid>,
+    pub parent_thread_id: Option<Uuid>,
+    pub sub_thread_ids: Vec<Uuid>,
     pub messages: Vec<Message>,
 }
 
@@ -18,8 +22,16 @@ impl Thread {
             id: Uuid::new_v4(),
             created_at: now,
             last_activity: now,
+            closed: false,
+            prev_thread_id: None,
+            parent_thread_id: None,
+            sub_thread_ids: Vec::new(),
             messages: vec![],
         }
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
     }
 
     pub fn append_user(&mut self, content: impl Into<String>) {

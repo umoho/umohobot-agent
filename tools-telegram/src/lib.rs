@@ -52,15 +52,15 @@ pub(crate) fn parse_dice_emoji(s: &str) -> Option<DiceEmoji> {
     }
 }
 
-use rig_core::tool::server::ToolServerHandle;
+use agent::{AgentError, AgentRuntime, CompletionModel};
 use telegram_host::{MessageCache, TelegramHost};
 pub async fn register_telegram_tools(
-    handle: &ToolServerHandle,
+    runtime: &AgentRuntime<impl CompletionModel + 'static>,
     host: TelegramHost,
     cache: MessageCache,
-) -> Result<(), rig_core::tool::server::ToolServerError> {
-    send::register_send_tools(handle, host.clone()).await?;
-    edit::register_edit_tools(handle, host.clone()).await?;
-    query::register_query_tools(handle, host, cache).await?;
+) -> Result<(), AgentError> {
+    send::register_send_tools(runtime, host.clone()).await?;
+    edit::register_edit_tools(runtime, host.clone()).await?;
+    query::register_query_tools(runtime, host, cache).await?;
     Ok(())
 }

@@ -1,7 +1,7 @@
 use crate::{ToolError, build_input_file, parse_dice_emoji};
+use agent::{AgentError, AgentRuntime, CompletionModel};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
-use rig_core::tool::server::ToolServerHandle;
 use serde::Deserialize;
 use serde_json::json;
 use telegram_host::TelegramHost;
@@ -1025,39 +1025,43 @@ impl Tool for SendMediaGroupTool {
     }
 }
 
-pub async fn register_send_tools(
-    handle: &ToolServerHandle,
+pub async fn register_send_tools<M: CompletionModel + 'static>(
+    runtime: &AgentRuntime<M>,
     host: TelegramHost,
-) -> Result<(), rig_core::tool::server::ToolServerError> {
-    handle
-        .add_tool(SendMessageTool { host: host.clone() })
+) -> Result<(), AgentError> {
+    runtime
+        .register_tool(SendMessageTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendChatActionTool { host: host.clone() })
+    runtime
+        .register_tool(SendChatActionTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendPhotoTool { host: host.clone() })
+    runtime
+        .register_tool(SendPhotoTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendVideoTool { host: host.clone() })
+    runtime
+        .register_tool(SendVideoTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendAudioTool { host: host.clone() })
+    runtime
+        .register_tool(SendAudioTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendDocumentTool { host: host.clone() })
+    runtime
+        .register_tool(SendDocumentTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendAnimationTool { host: host.clone() })
+    runtime
+        .register_tool(SendAnimationTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendVoiceTool { host: host.clone() })
+    runtime
+        .register_tool(SendVoiceTool { host: host.clone() })
         .await?;
-    handle
-        .add_tool(SendStickerTool { host: host.clone() })
+    runtime
+        .register_tool(SendStickerTool { host: host.clone() })
         .await?;
-    handle.add_tool(SendDiceTool { host: host.clone() }).await?;
-    handle.add_tool(SendPollTool { host: host.clone() }).await?;
-    handle.add_tool(SendMediaGroupTool { host }).await?;
+    runtime
+        .register_tool(SendDiceTool { host: host.clone() })
+        .await?;
+    runtime
+        .register_tool(SendPollTool { host: host.clone() })
+        .await?;
+    runtime.register_tool(SendMediaGroupTool { host }).await?;
     Ok(())
 }

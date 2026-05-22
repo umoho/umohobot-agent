@@ -1,6 +1,6 @@
+use agent::{AgentError, AgentRuntime, CompletionModel};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
-use rig_core::tool::server::ToolServerHandle;
 use serde::Deserialize;
 use serde_json::json;
 use telegram_host::{MessageCache, TelegramHost};
@@ -230,31 +230,31 @@ impl Tool for QueryMessagesByUserTool {
     }
 }
 
-pub async fn register_query_tools(
-    handle: &ToolServerHandle,
+pub async fn register_query_tools<M: CompletionModel + 'static>(
+    runtime: &AgentRuntime<M>,
     host: TelegramHost,
     cache: MessageCache,
-) -> Result<(), rig_core::tool::server::ToolServerError> {
-    handle
-        .add_tool(QueryMessageTool {
+) -> Result<(), AgentError> {
+    runtime
+        .register_tool(QueryMessageTool {
             host: host.clone(),
             cache: cache.clone(),
         })
         .await?;
-    handle
-        .add_tool(QueryMessagesTool {
+    runtime
+        .register_tool(QueryMessagesTool {
             host: host.clone(),
             cache: cache.clone(),
         })
         .await?;
-    handle
-        .add_tool(QuerySearchTool {
+    runtime
+        .register_tool(QuerySearchTool {
             host: host.clone(),
             cache: cache.clone(),
         })
         .await?;
-    handle
-        .add_tool(QueryMessagesByUserTool { host, cache })
+    runtime
+        .register_tool(QueryMessagesByUserTool { host, cache })
         .await?;
     Ok(())
 }

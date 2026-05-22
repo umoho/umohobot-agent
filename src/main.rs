@@ -4,6 +4,7 @@ use agent::{AgentBuilder, Capability};
 use data_buffer::DataBuffer;
 use telegram_host::{MessageCache, TelegramHost};
 use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
+use tools_subagent::register_subagent_tools;
 use tools_telegram::{TelegramDownloadTool, register_telegram_tools};
 use tools_web::WebFetchTool;
 use tracing::info;
@@ -79,40 +80,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         agent_builder = agent_builder.base_url(base_url);
     }
 
-    let agent_runtime = agent_builder.build()?;
+    let agent_runtime = Arc::new(agent_builder.build()?);
 
     let cache = MessageCache::new(200);
 
-    register_telegram_tools(
-        &agent_runtime.agent().tool_server_handle,
-        telegram_host.clone(),
-        cache.clone(),
-    )
-    .await?;
+    register_telegram_tools(agent_runtime.as_ref(), telegram_host.clone(), cache.clone()).await?;
 
-    agent_runtime
-        .agent()
-        .tool_server_handle
-        .add_tool(WebFetchTool)
-        .await?;
+    agent_runtime.register_tool(WebFetchTool).await?;
 
     let data_buffer = DataBuffer::new();
     let trigger_buffer = data_buffer.clone();
     let ocr_backend = Box::new(OcrsBackend::new().await?);
     agent_runtime
-        .agent()
-        .tool_server_handle
-        .add_tool(ImageOcrTool::new(ocr_backend, data_buffer.clone()))
+        .register_tool(ImageOcrTool::new(ocr_backend, data_buffer.clone()))
         .await?;
 
     agent_runtime
-        .agent()
-        .tool_server_handle
-        .add_tool(TelegramDownloadTool {
+        .register_tool(TelegramDownloadTool {
             host: telegram_host.clone(),
             buffer: data_buffer,
         })
         .await?;
+
+    register_subagent_tools(agent_runtime.clone()).await?;
 
     let config = TriggerConfig {
         idle_timeout: chrono::Duration::seconds(cli.idle_timeout_seconds as i64),
@@ -123,7 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let trigger = TelegramTrigger::new(
         telegram_host,
-        Arc::new(agent_runtime),
+        agent_runtime.clone(),
         config,
         cache,
         trigger_buffer,
