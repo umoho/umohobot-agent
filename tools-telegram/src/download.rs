@@ -5,6 +5,7 @@ use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
 use telegram_host::TelegramHost;
+use teloxide::net::Download;
 use teloxide::prelude::Requester;
 use teloxide::types::FileId;
 
@@ -44,24 +45,13 @@ impl Tool for TelegramDownloadTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let file = self.host.bot().get_file(FileId(args.file_id)).await?;
-        let url = format!(
-            "{}file/bot{}/{}",
-            self.host.bot().api_url(),
-            self.host.token(),
-            file.path
-        );
-        let bytes = self
-            .host
+        let mut buf = Vec::new();
+        self.host
             .bot()
-            .client()
-            .get(&url)
-            .send()
+            .download_file(&file.path, &mut buf)
             .await
-            .map_err(|e| ToolError::Telegram(e.into()))?
-            .bytes()
-            .await
-            .map_err(|e| ToolError::Telegram(e.into()))?;
-        let key = self.buffer.store(bytes.to_vec());
+            .map_err(|e| ToolError::Request(e.into()))?;
+        let key = self.buffer.store(buf);
         Ok(format!(
             "File downloaded to buffer. Use buffer key \"{}\" with other tools like image_ocr.",
             key
