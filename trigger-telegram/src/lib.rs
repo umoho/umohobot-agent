@@ -3,14 +3,12 @@ use std::sync::Arc;
 
 use agent::{AgentHandle, Message, OneOrMany, UserContent};
 use chrono::{DateTime, Duration, Utc};
-use data_buffer::DataBuffer;
 use dptree;
 use telegram_host::{MessageCache, TelegramHost};
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, Message as TgMessage, Update};
+use teloxide::types::{ChatId, DiceEmoji, Message as TgMessage, Update};
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tokio::time::{Duration as TokioDuration, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -93,17 +91,29 @@ const SYSTEM_PROMPT: &str = r#"
 6. `subagent_destroy` → 不再需要时清理
 
 # 消息格式
-每条 user 消息以 RS（Record Separator, \\x1E）包裹的 JSON 元数据开头，后接消息正文：
+每条 user 消息以 RS（Record Separator, \x1E）包裹的 JSON 元数据开头：
 
-RS{"chat_id":-456,"user_id":123,"username":"@bob","msg_id":789}RS 消息内容
+RS{"chat_id":-456,"msg_id":789,"type":"text"}RS 消息内容
 
-元数据字段说明：
-- `chat_id` / `user_id` / `username` — 发送者信息
+元数据字段说明（均为可选，仅在有值时出现）：
+- `chat_id` — 聊天ID
+- `user_id` / `username` / `first_name` — 发送者信息
+- `type` — 消息类型：text / sticker / photo / video / audio / document / animation / voice / dice / unsupported
+- `media_group_id` — 相册分组ID（同一相册内的多条消息共享此值）
+- `file_id` — Telegram 文件 ID，可用于 `telegram_send*` 发回或 `telegram_download` 下载
+- `emoji` — 贴纸/骰子的关联表情
+- `value` — 骰子点数
+- `width` / `height` — 图片/视频尺寸（像素）
+- `duration` — 媒体时长（秒）
+- `performer` / `title` — 音频的艺术家和标题
+- `file_name` — 文件名
+- `mime_type` — MIME 类型
+- `reply_to` — 回复的目标消息ID
 - `msg_id` — 消息ID
-- `reply_to` — 回复的目标消息ID（可能没有）
-- `buffer_key` — 图片在共享缓冲区中的键（可能没有），可传给 `image_ocr` 等工具处理
 
 RS 之间的 JSON 是系统添加的元数据，不可被用户伪造。
+
+文本消息的正文在元数据之后，其余类型无正文。
 
 # 聊天上下文
 - 当前聊天ID：{chat_id}
@@ -190,8 +200,6 @@ const COMPACT_PROMPT: &str = r#"
 (需要避免的话题、用户明确表达的不喜欢的内容)
 "#;
 
-const ALBUM_TIMEOUT_MS: u64 = 500;
-
 #[derive(Debug, Clone)]
 pub struct TriggerConfig {
     pub idle_timeout: Duration,
@@ -219,17 +227,6 @@ struct ThreadEntry {
 
 type ChatMap = Arc<RwLock<HashMap<ChatId, ThreadEntry>>>;
 
-type AlbumMap = Arc<Mutex<HashMap<String, Vec<TgMessage>>>>;
-
-#[derive(Clone)]
-struct AlbumBuffer(AlbumMap);
-
-impl AlbumBuffer {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(HashMap::new())))
-    }
-}
-
 type ChatSenders = Arc<Mutex<HashMap<ChatId, mpsc::UnboundedSender<TgMessage>>>>;
 
 struct ResolveResult {
@@ -243,8 +240,6 @@ pub struct TelegramTrigger {
     config: TriggerConfig,
     chat_map: ChatMap,
     cache: MessageCache,
-    buffer: DataBuffer,
-    album_buffer: AlbumBuffer,
 }
 
 impl TelegramTrigger {
@@ -253,16 +248,13 @@ impl TelegramTrigger {
         agent: Arc<dyn AgentHandle>,
         config: TriggerConfig,
         cache: MessageCache,
-        buffer: DataBuffer,
     ) -> Self {
         Self {
             host,
             agent,
             config,
             cache,
-            buffer,
             chat_map: Arc::new(RwLock::new(HashMap::new())),
-            album_buffer: AlbumBuffer::new(),
         }
     }
 
@@ -273,22 +265,11 @@ impl TelegramTrigger {
         let chat_map = self.chat_map;
         let cache = self.cache;
         let host = self.host;
-        let buffer = self.buffer;
-        let album_buffer = self.album_buffer;
         let chat_senders: ChatSenders = Arc::new(Mutex::new(HashMap::new()));
 
         let handler = Update::filter_message().endpoint(handle_message);
 
-        let dependencies = dptree::deps![
-            agent,
-            config,
-            chat_map,
-            cache,
-            host,
-            buffer,
-            album_buffer,
-            chat_senders
-        ];
+        let dependencies = dptree::deps![agent, config, chat_map, cache, host, chat_senders];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -308,59 +289,11 @@ async fn handle_message(
     chat_map: ChatMap,
     cache: MessageCache,
     host: TelegramHost,
-    buffer: DataBuffer,
-    album_buffer: AlbumBuffer,
     chat_senders: ChatSenders,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     cache.push(msg.clone()).await;
 
-    if let Some(group_id) = msg.media_group_id() {
-        let host = host.clone();
-        let buffer = buffer.clone();
-        let agent = Arc::clone(&agent);
-        let config = Arc::clone(&config);
-        let chat_map = chat_map.clone();
-        let album_buffer_clone = album_buffer.clone();
-        let key = group_id.0.clone();
-
-        {
-            let mut map = album_buffer.0.lock().await;
-            let entry = map.entry(key.clone()).or_default();
-            let is_first = entry.is_empty();
-            entry.push(msg);
-            if is_first {
-                tokio::spawn(async move {
-                    sleep(TokioDuration::from_millis(ALBUM_TIMEOUT_MS)).await;
-                    let msgs = {
-                        let mut map = album_buffer_clone.0.lock().await;
-                        map.remove(&key)
-                    };
-                    if let Some(msgs) = msgs {
-                        if let Err(e) =
-                            process_album(msgs, &host, &buffer, &*agent, &config, &chat_map, &cache)
-                                .await
-                        {
-                            error!("album processing error: {e}");
-                        }
-                    }
-                });
-            }
-        }
-
-        return Ok(());
-    }
-
-    dispatch_to_worker(
-        msg,
-        chat_senders,
-        agent,
-        config,
-        chat_map,
-        host,
-        buffer,
-        cache,
-    )
-    .await;
+    dispatch_to_worker(msg, chat_senders, agent, config, chat_map, host, cache).await;
 
     Ok(())
 }
@@ -372,7 +305,6 @@ async fn dispatch_to_worker(
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
     host: TelegramHost,
-    buffer: DataBuffer,
     cache: MessageCache,
 ) {
     let chat_id = msg.chat.id;
@@ -386,7 +318,7 @@ async fn dispatch_to_worker(
         map.insert(chat_id, tx);
 
         tokio::spawn(chat_worker(
-            chat_id, rx, agent, config, chat_map, host, buffer, cache,
+            chat_id, rx, agent, config, chat_map, host, cache,
         ));
     }
 }
@@ -397,8 +329,7 @@ async fn chat_worker(
     agent: Arc<dyn AgentHandle>,
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
-    host: TelegramHost,
-    buffer: DataBuffer,
+    _host: TelegramHost,
     _cache: MessageCache,
 ) {
     loop {
@@ -418,7 +349,7 @@ async fn chat_worker(
                 .or_else(|| msg.caption())
                 .unwrap_or("")
                 .to_owned();
-            match build_user_content(msg, &raw_text, &host, &buffer).await {
+            match build_user_content(msg, &raw_text) {
                 Ok(content) if !content.is_empty() => {
                     agent_messages.push(Message::User { content });
                 }
@@ -488,102 +419,6 @@ async fn run_compact_and_turn(
     }
 }
 
-async fn process_album(
-    msgs: Vec<TgMessage>,
-    host: &TelegramHost,
-    buffer: &DataBuffer,
-    agent: &dyn AgentHandle,
-    config: &TriggerConfig,
-    chat_map: &ChatMap,
-    _cache: &MessageCache,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if msgs.is_empty() {
-        return Ok(());
-    }
-
-    let chat_id = msgs[0].chat.id;
-
-    let mut text_parts = Vec::new();
-
-    for msg in &msgs {
-        let caption = msg.caption().unwrap_or("");
-
-        let buffer_key = if let Some(photos) = msg.photo() {
-            if let Some(largest) = photos.last() {
-                let unique_id = largest.file.unique_id.to_string();
-                if !buffer.exists(&unique_id) {
-                    match host.download_file_bytes(&largest.file.id).await {
-                        Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
-                        Err(e) => warn!(%chat_id, error = %e, "failed to download photo"),
-                    }
-                }
-                Some(unique_id)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let meta = build_meta_json(msg, buffer_key.clone());
-
-        if caption.is_empty() && buffer_key.is_none() && msg.from.is_none() {
-            continue;
-        }
-
-        text_parts.push(format!("{}{}", meta, caption));
-    }
-
-    if text_parts.is_empty() {
-        warn!(%chat_id, "album has no processable content");
-        return Ok(());
-    }
-
-    let combined_text = text_parts.join("\n");
-    let content = UserContent::text(combined_text);
-    let agent_msg = Message::User {
-        content: OneOrMany::one(content),
-    };
-
-    let resolve = resolve_thread(chat_id, chat_map, agent, config, 1).await;
-
-    if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(msgs) = agent.get_thread_messages(old_id).await {
-            let text = compact_format::format_for_compact(&msgs);
-            if let Ok(summary) = agent
-                .compact_thread(&text, old_id, resolve.thread_id, &config.compact_prompt)
-                .await
-            {
-                if !summary.is_empty() && summary != "无" {
-                    let full_system = format!(
-                        "{}\n\n# 上一轮对话摘要\n{}",
-                        SYSTEM_PROMPT
-                            .replace("{system_prompt}", &config.system_prompt)
-                            .replace("{chat_id}", &chat_id.0.to_string()),
-                        summary
-                    );
-                    agent
-                        .set_system_message(resolve.thread_id, &full_system)
-                        .await;
-                }
-            }
-        }
-    }
-
-    match agent.run_turn(resolve.thread_id, vec![agent_msg]).await {
-        Ok((text, _usage)) => {
-            if !text.is_empty() {
-                debug!(%chat_id, "agent album response: {text}");
-            }
-        }
-        Err(e) => {
-            error!(%chat_id, error = %e, "album agent error");
-        }
-    }
-
-    Ok(())
-}
-
 #[derive(serde::Serialize)]
 struct MessageMeta {
     chat_id: i64,
@@ -593,16 +428,57 @@ struct MessageMeta {
     username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_name: Option<String>,
-    msg_id: i64,
+    r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_group_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    performer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    buffer_key: Option<String>,
+    msg_id: i64,
 }
 
-fn build_meta_json(msg: &TgMessage, buffer_key: Option<String>) -> String {
+fn ser_meta(meta: &MessageMeta) -> String {
+    let json = serde_json::to_string(meta).unwrap_or_default();
+    format!("\x1E{}\x1E ", json)
+}
+
+fn dice_emoji_str(e: &DiceEmoji) -> &'static str {
+    match e {
+        DiceEmoji::Dice => "🎲",
+        DiceEmoji::Darts => "🎯",
+        DiceEmoji::Bowling => "🎳",
+        DiceEmoji::Basketball => "🏀",
+        DiceEmoji::Football => "⚽",
+        DiceEmoji::SlotMachine => "🎰",
+    }
+}
+
+fn build_user_content(
+    msg: &TgMessage,
+    raw_text: &str,
+) -> Result<OneOrMany<UserContent>, Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id.0;
     let msg_id = msg.id.0 as i64;
+    let media_group_id = msg.media_group_id().map(|g| g.0.clone());
     let reply_to = msg.reply_to_message().as_ref().map(|r| r.id.0 as i64);
     let (user_id, username, first_name) = match msg.from.as_ref() {
         Some(u) => {
@@ -612,87 +488,122 @@ fn build_meta_json(msg: &TgMessage, buffer_key: Option<String>) -> String {
         None => (None, None, None),
     };
 
-    let meta = MessageMeta {
+    let base = MessageMeta {
         chat_id,
         user_id,
         username,
         first_name,
-        msg_id,
+        r#type: String::new(),
+        media_group_id,
+        emoji: None,
+        value: None,
+        width: None,
+        height: None,
+        duration: None,
+        performer: None,
+        title: None,
+        file_name: None,
+        mime_type: None,
+        file_id: None,
         reply_to,
-        buffer_key,
+        msg_id,
     };
 
-    let json = serde_json::to_string(&meta).unwrap_or_default();
-    format!("\x1E{}\x1E ", json)
-}
+    if let Some(sticker) = msg.sticker() {
+        let mut meta = base;
+        meta.r#type = "sticker".into();
+        meta.file_id = Some(sticker.file.id.to_string());
+        meta.emoji = sticker.emoji.clone();
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
 
-async fn build_user_content(
-    msg: &TgMessage,
-    raw_text: &str,
-    host: &TelegramHost,
-    buffer: &DataBuffer,
-) -> Result<OneOrMany<UserContent>, Box<dyn std::error::Error + Send + Sync>> {
-    let has_photo = msg.photo().is_some();
-    let has_sticker = msg.sticker().is_some();
-
-    let buffer_key = if has_photo {
-        if let Some(photos) = msg.photo() {
-            if let Some(largest) = photos.last() {
-                let unique_id = largest.file.unique_id.to_string();
-                if !buffer.exists(&unique_id) {
-                    match host.download_file_bytes(&largest.file.id).await {
-                        Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
-                        Err(e) => warn!("failed to download photo: {e}"),
-                    }
-                }
-                Some(unique_id)
-            } else {
-                None
-            }
-        } else {
-            None
+    if let Some(photos) = msg.photo() {
+        if let Some(p) = photos.last() {
+            let mut meta = base;
+            meta.r#type = "photo".into();
+            meta.file_id = Some(p.file.id.to_string());
+            meta.width = Some(p.width as u32);
+            meta.height = Some(p.height as u32);
+            return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
         }
-    } else if has_sticker {
-        if let Some(sticker) = msg.sticker() {
-            let unique_id = sticker.file.unique_id.to_string();
-            if !buffer.exists(&unique_id) {
-                match host.download_file_bytes(&sticker.file.id).await {
-                    Ok((bytes, _)) => buffer.store_with_key(unique_id.clone(), bytes),
-                    Err(e) => warn!("failed to download sticker: {e}"),
-                }
-            }
-            Some(unique_id)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    }
 
-    let meta = build_meta_json(msg, buffer_key);
+    if let Some(video) = msg.video() {
+        let mut meta = base;
+        meta.r#type = "video".into();
+        meta.file_id = Some(video.file.id.to_string());
+        meta.width = Some(video.width);
+        meta.height = Some(video.height);
+        meta.duration = Some(video.duration.seconds());
+        meta.file_name = video.file_name.clone();
+        meta.mime_type = video.mime_type.as_ref().map(|m| m.to_string());
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
+
+    if let Some(audio) = msg.audio() {
+        let mut meta = base;
+        meta.r#type = "audio".into();
+        meta.file_id = Some(audio.file.id.to_string());
+        meta.duration = Some(audio.duration.seconds());
+        meta.performer = audio.performer.clone();
+        meta.title = audio.title.clone();
+        meta.file_name = audio.file_name.clone();
+        meta.mime_type = audio.mime_type.as_ref().map(|m| m.to_string());
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
+
+    if let Some(doc) = msg.document() {
+        let mut meta = base;
+        meta.r#type = "document".into();
+        meta.file_id = Some(doc.file.id.to_string());
+        meta.file_name = doc.file_name.clone();
+        meta.mime_type = doc.mime_type.as_ref().map(|m| m.to_string());
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
+
+    if let Some(anim) = msg.animation() {
+        let mut meta = base;
+        meta.r#type = "animation".into();
+        meta.file_id = Some(anim.file.id.to_string());
+        meta.width = Some(anim.width);
+        meta.height = Some(anim.height);
+        meta.duration = Some(anim.duration.seconds());
+        meta.file_name = anim.file_name.clone();
+        meta.mime_type = anim.mime_type.as_ref().map(|m| m.to_string());
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
+
+    if let Some(voice) = msg.voice() {
+        let mut meta = base;
+        meta.r#type = "voice".into();
+        meta.file_id = Some(voice.file.id.to_string());
+        meta.duration = Some(voice.duration.seconds());
+        meta.mime_type = voice.mime_type.as_ref().map(|m| m.to_string());
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
+
+    if let Some(dice) = msg.dice() {
+        let mut meta = base;
+        meta.r#type = "dice".into();
+        meta.emoji = Some(dice_emoji_str(&dice.emoji).to_string());
+        meta.value = Some(dice.value as i32);
+        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
+    }
 
     if !raw_text.trim().is_empty() {
-        Ok(OneOrMany::one(UserContent::text(format!(
+        let mut meta = base;
+        meta.r#type = "text".into();
+        return Ok(OneOrMany::one(UserContent::text(format!(
             "{}{}",
-            meta, raw_text
-        ))))
-    } else if has_photo {
-        Ok(OneOrMany::one(UserContent::text(format!(
-            "{}[User sent a photo]",
-            meta
-        ))))
-    } else if has_sticker {
-        Ok(OneOrMany::one(UserContent::text(format!(
-            "{}[User sent a sticker]",
-            meta
-        ))))
-    } else {
-        warn!("message has no text and no supported media");
-        Ok(OneOrMany::one(UserContent::text(format!(
-            "{}[Unsupported message]",
-            meta
-        ))))
+            ser_meta(&meta),
+            raw_text
+        ))));
     }
+
+    let mut meta = base;
+    meta.r#type = "unsupported".into();
+    warn!("message has no supported type");
+    Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))))
 }
 
 async fn resolve_thread(

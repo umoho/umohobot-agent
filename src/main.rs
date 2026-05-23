@@ -89,7 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     agent_runtime.register_tool(WebFetchTool).await?;
 
     let data_buffer = DataBuffer::new();
-    let trigger_buffer = data_buffer.clone();
     let ocr_backend = Box::new(OcrsBackend::new().await?);
     agent_runtime
         .register_tool(ImageOcrTool::new(ocr_backend, data_buffer.clone()))
@@ -111,13 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         compact_prompt: cli.compact_prompt.unwrap_or_default(),
     };
 
-    let trigger = TelegramTrigger::new(
-        telegram_host,
-        agent_runtime.clone(),
-        config,
-        cache,
-        trigger_buffer,
-    );
+    let trigger = TelegramTrigger::new(telegram_host, agent_runtime.clone(), config, cache);
 
     trigger.start().await
 }
