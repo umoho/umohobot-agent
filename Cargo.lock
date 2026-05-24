@@ -4175,10 +4175,19 @@ dependencies = [
 name = "tools-web"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "governor",
+ "htmd",
+ "regex",
+ "reqwest 0.12.28",
  "rig-core",
+ "scraper",
  "serde",
  "serde_json",
+ "texting_robots",
  "thiserror 2.0.18",
+ "tokio",
+ "url",
  "web2llm",
 ]
 

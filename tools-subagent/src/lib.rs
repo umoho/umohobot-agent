@@ -71,7 +71,7 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
                     },
                     "tools": {
                         "type": "string",
-                        "description": "Tool whitelist: comma-separated tool names or namespaces (e.g. \"web_fetch,image_ocr\" or \"web\" or \"all\"). Empty means no tools."
+                        "description": "Tool whitelist: comma-separated tool names or namespaces (e.g. \"web_scrape,image_ocr\" or \"web\" or \"all\"). Empty means no tools."
                     }
                 },
                 "required": ["name"]

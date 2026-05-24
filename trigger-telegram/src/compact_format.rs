@@ -29,10 +29,12 @@ pub fn format_for_compact(messages: &[Message]) -> String {
                                 .get("text")
                                 .and_then(|v| v.as_str())
                                 .map(|text| format!("Assistant: {text}")),
-                            "web_fetch" => tc
+                            "web_scrape" | "web_fetch" | "web_find" => tc
                                 .function
                                 .arguments
-                                .get("url")
+                                .get("urls")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.first())
                                 .and_then(|v| v.as_str())
                                 .map(|url| format!("Assistant fetched {url}")),
                             name => Some(format!("Assistant called a tool {name}")),

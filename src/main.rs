@@ -6,7 +6,7 @@ use telegram_host::{MessageCache, TelegramHost};
 use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
 use tools_subagent::register_subagent_tools;
 use tools_telegram::{TelegramDownloadTool, register_telegram_tools};
-use tools_web::WebFetchTool;
+use tools_web::{WebFetchTool, WebFindTool, WebScrapeTool};
 use tracing::info;
 use trigger_telegram::{TelegramTrigger, TriggerConfig};
 
@@ -86,7 +86,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     register_telegram_tools(agent_runtime.as_ref(), telegram_host.clone(), cache.clone()).await?;
 
+    agent_runtime.register_tool(WebScrapeTool).await?;
     agent_runtime.register_tool(WebFetchTool).await?;
+    agent_runtime.register_tool(WebFindTool).await?;
 
     let data_buffer = DataBuffer::new();
     let ocr_backend = Box::new(OcrsBackend::new().await?);

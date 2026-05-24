@@ -8,4 +8,14 @@ rig-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio = { workspace = true }
+
 web2llm = { version = "0.4", default-features = false }
+scraper = "0.25"
+texting_robots = "0.2"
+governor = "0.10"
+futures = "0.3"
+htmd = "0.5"
+regex = "1"
