@@ -6,6 +6,7 @@ use telegram_host::{MessageCache, TelegramHost};
 use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
 use tools_subagent::register_subagent_tools;
 use tools_telegram::{TelegramDownloadTool, register_telegram_tools};
+use tools_time::{TimerConfig, TimerExpiry, register_time_tools};
 use tools_web::{WebFetchTool, WebFindTool, WebScrapeTool};
 use tracing::info;
 use trigger_telegram::{TelegramTrigger, TriggerConfig};
@@ -105,6 +106,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     register_subagent_tools(agent_runtime.clone()).await?;
 
+    let (expiry_tx, expiry_rx) = tokio::sync::mpsc::unbounded_channel::<TimerExpiry>();
+    register_time_tools(agent_runtime.clone(), TimerConfig::default(), expiry_tx).await?;
+
     let config = TriggerConfig {
         idle_timeout: chrono::Duration::seconds(cli.idle_timeout_seconds as i64),
         max_thread_length: cli.max_thread_length,
@@ -112,7 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         compact_prompt: cli.compact_prompt.unwrap_or_default(),
     };
 
-    let trigger = TelegramTrigger::new(telegram_host, agent_runtime.clone(), config, cache);
+    let trigger = TelegramTrigger::new(
+        telegram_host,
+        agent_runtime.clone(),
+        config,
+        cache,
+        Some(expiry_rx),
+    );
 
     trigger.start().await
 }

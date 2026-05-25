@@ -1,0 +1,15 @@
+[package]
+name = "tools-time"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+agent = { path = "../agent" }
+rig-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono-english = "0.1"
