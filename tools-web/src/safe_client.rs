@@ -53,9 +53,12 @@ impl SafeClient {
         }
     }
 
-    pub async fn fetch(
+    pub async fn request(
         &self,
         url_str: &str,
+        method: reqwest::Method,
+        body: Option<String>,
+        content_type: Option<&str>,
         ignore_robots: bool,
     ) -> Result<String, SafeClientError> {
         let parsed =
@@ -69,7 +72,15 @@ impl SafeClient {
 
         self.limiter.until_ready().await;
 
-        let response = tokio::time::timeout(self.timeout, self.client.get(url_str).send())
+        let mut req = self.client.request(method, url_str);
+        if let Some(b) = body {
+            if let Some(ct) = content_type {
+                req = req.header("Content-Type", ct);
+            }
+            req = req.body(b);
+        }
+
+        let response = tokio::time::timeout(self.timeout, req.send())
             .await
             .map_err(|_| SafeClientError::Timeout(self.timeout.as_secs()))??;
 
@@ -81,6 +92,15 @@ impl SafeClient {
         }
 
         Ok(response.text().await?)
+    }
+
+    pub async fn fetch(
+        &self,
+        url_str: &str,
+        ignore_robots: bool,
+    ) -> Result<String, SafeClientError> {
+        self.request(url_str, reqwest::Method::GET, None, None, ignore_robots)
+            .await
     }
 
     async fn check_ssrf(&self, parsed: &url::Url) -> Result<(), SafeClientError> {

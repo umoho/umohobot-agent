@@ -19,6 +19,12 @@ pub enum WebFetchError {
 pub struct WebFetchArgs {
     pub urls: Vec<String>,
     #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
     pub selector: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
@@ -49,6 +55,19 @@ impl Tool for WebFetchTool {
                         "items": {"type": "string"},
                         "description": "URLs to fetch (at least one, fetched in parallel)"
                     },
+                    "method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "HTTP method. Default: GET."
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Request body (for POST). Raw string; use content_type to specify format (JSON, form-encoded, etc.)."
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "Content-Type header for the body (e.g. application/json, application/x-www-form-urlencoded). Ignored when no body is set."
+                    },
                     "selector": {
                         "type": "string",
                         "description": "Optional CSS selector. If set, only content from matching elements is returned. Works with all formats."
@@ -77,11 +96,17 @@ impl Tool for WebFetchTool {
             return Err(WebFetchError::NoUrls);
         }
 
+        let method = match args.method.as_deref().unwrap_or("GET") {
+            "POST" => reqwest::Method::POST,
+            _ => reqwest::Method::GET,
+        };
         let timeout = args.timeout_secs.unwrap_or(30);
         let client = SafeClient::new(timeout);
 
         let format = args.format.as_deref().unwrap_or("markdown");
         let selector_str = args.selector.as_deref();
+        let body = args.body.clone();
+        let content_type = args.content_type.as_deref();
 
         let futures: Vec<_> = args
             .urls
@@ -90,6 +115,9 @@ impl Tool for WebFetchTool {
                 fetch_one(
                     &client,
                     url,
+                    method.clone(),
+                    body.clone(),
+                    content_type,
                     selector_str,
                     format,
                     args.ignore_robots.unwrap_or(false),
@@ -114,11 +142,16 @@ impl Tool for WebFetchTool {
 async fn fetch_one(
     client: &SafeClient,
     url: &str,
+    method: reqwest::Method,
+    body: Option<String>,
+    content_type: Option<&str>,
     selector: Option<&str>,
     format: &str,
     ignore_robots: bool,
 ) -> Result<String, WebFetchError> {
-    let html = client.fetch(url, ignore_robots).await?;
+    let html = client
+        .request(url, method, body, content_type, ignore_robots)
+        .await?;
 
     let document = scraper::Html::parse_document(&html);
 

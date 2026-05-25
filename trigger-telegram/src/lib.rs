@@ -66,8 +66,8 @@ const SYSTEM_PROMPT: &str = r#"
 
 ## Web 系列
 - `web_scrape` — 抓取网页内容为 Markdown 文本(自动去噪评分，支持多URL并行)
-- `web_fetch` — 灵活抓取网页，支持CSS选择器提取和多种格式输出(text/html/markdown)
-- `web_find` — 在网页中搜索关键词，返回匹配元素在DOM中的CSS选择器路径和上下文
+- `web_fetch` — 灵活抓取网页，支持 GET/POST、CSS 选择器提取和多种格式输出(text/html/markdown)
+- `web_find` — 在网页中搜索关键词，支持 GET/POST，返回匹配元素在DOM中的CSS选择器路径和上下文
 
 ## 图像处理 系列
 - `image_ocr` — 识别图片中的文字。支持两种输入方式：
