@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use agent::{AgentError, AgentRuntime};
-use rig_core::completion::CompletionModel;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -44,7 +43,7 @@ pub struct TimerExpiry {
 }
 
 pub async fn register_time_tools(
-    runtime: Arc<AgentRuntime<impl CompletionModel + 'static>>,
+    runtime: Arc<AgentRuntime>,
     config: TimerConfig,
     expiry_tx: UnboundedSender<TimerExpiry>,
 ) -> Result<(), AgentError> {

@@ -1,5 +1,5 @@
 use crate::{ToolError, build_input_file};
-use agent::{AgentError, AgentRuntime, CompletionModel};
+use agent::{AgentError, AgentRuntime};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -457,8 +457,8 @@ impl Tool for SetMessageReactionTool {
     }
 }
 
-pub async fn register_edit_tools<M: CompletionModel + 'static>(
-    runtime: &AgentRuntime<M>,
+pub async fn register_edit_tools(
+    runtime: &AgentRuntime,
     host: TelegramHost,
 ) -> Result<(), AgentError> {
     runtime

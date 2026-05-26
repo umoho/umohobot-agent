@@ -4,42 +4,52 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use rig_core::agent::Agent;
-use rig_core::completion::{CompletionModel, Message};
+use rig_core::client::CompletionClient;
+use rig_core::completion::Message;
+use rig_core::providers::openai;
 use rig_core::tool::ToolDyn;
 
 use crate::dyn_tool::DynTool;
 use crate::error::AgentError;
+use crate::pool::{Account, ModelPool};
 use crate::thread::Thread;
-use crate::types::{CreatedSubagent, ModelConfig, SubagentEntry, SubagentStatus};
+use crate::types::{CreatedSubagent, SubagentEntry, SubagentStatus};
 use crate::{CURRENT_PARENT_THREAD_ID, ThreadStore, run_turn_inner};
 
-pub struct AgentRuntime<M: CompletionModel> {
-    pub(crate) agent: Agent<M>,
+type CompletionModel = openai::CompletionModel;
+
+pub struct AgentRuntime {
+    pub(crate) agent: Agent<CompletionModel>,
     pub(crate) threads: ThreadStore,
     pub(crate) capabilities: Vec<crate::Capability>,
     pub(crate) tool_registry: Arc<RwLock<HashMap<String, DynTool>>>,
-    pub(crate) subagents: Arc<RwLock<HashMap<(Uuid, String), SubagentEntry<M>>>>,
-    pub model_config: ModelConfig,
+    pub(crate) subagents: Arc<RwLock<HashMap<(Uuid, String), SubagentEntry<CompletionModel>>>>,
+    pub(crate) model_pool: Arc<ModelPool>,
+    pub parent_account: Arc<Account>,
+    pub(crate) max_turns: usize,
 }
 
-impl<M: CompletionModel + 'static> AgentRuntime<M> {
+impl AgentRuntime {
     pub fn new(
-        agent: Agent<M>,
-        threads: ThreadStore,
+        agent: Agent<CompletionModel>,
         capabilities: Vec<crate::Capability>,
-        model_config: ModelConfig,
+        model_pool: Arc<ModelPool>,
+        parent_account: Arc<Account>,
+        max_turns: usize,
     ) -> Self {
         Self {
             agent,
-            threads,
+            threads: Arc::new(RwLock::new(HashMap::new())),
             capabilities,
             tool_registry: Arc::new(RwLock::new(HashMap::new())),
             subagents: Arc::new(RwLock::new(HashMap::new())),
-            model_config,
+            model_pool,
+            parent_account,
+            max_turns,
         }
     }
 
-    pub fn agent(&self) -> &Agent<M> {
+    pub fn agent(&self) -> &Agent<CompletionModel> {
         &self.agent
     }
 
@@ -79,10 +89,25 @@ impl<M: CompletionModel + 'static> AgentRuntime<M> {
         name: &str,
         system_prompt: Option<&str>,
         tools: &str,
+        model: Option<&str>,
     ) -> Result<CreatedSubagent, AgentError> {
         let parent_id = CURRENT_PARENT_THREAD_ID
             .try_with(|id| *id)
             .map_err(|_| AgentError::NotInContext)?;
+
+        let (provider, model_name) = self
+            .model_pool
+            .resolve_model(
+                model,
+                &self.parent_account.provider,
+                &self.parent_account.model,
+            )
+            .map_err(AgentError::ModelResolution)?;
+
+        let account = self
+            .model_pool
+            .allocate(parent_id, &provider, &model_name)
+            .await;
 
         let token = Uuid::new_v4().to_string();
         let thread_id = Uuid::new_v4();
@@ -114,7 +139,16 @@ impl<M: CompletionModel + 'static> AgentRuntime<M> {
             handle
         };
 
-        let mut sub_agent: Agent<M> = self.agent.clone();
+        let client = openai::Client::builder()
+            .api_key(&account.api_key)
+            .base_url(&account.base_url)
+            .build()?;
+
+        let mut sub_agent: Agent<CompletionModel> = client
+            .completions_api()
+            .agent(&account.model)
+            .default_max_turns(self.max_turns)
+            .build();
         sub_agent.tool_server_handle = filtered;
 
         self.get_or_create_thread(thread_id).await;

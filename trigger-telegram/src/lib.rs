@@ -15,6 +15,30 @@ use uuid::Uuid;
 
 mod compact_format;
 
+fn format_available_models(models: &[agent::ModelInfo]) -> String {
+    if models.is_empty() {
+        return "(no models configured)".to_string();
+    }
+    let mut lines: Vec<String> = models
+        .iter()
+        .map(|m| {
+            let cap_str = if m.capabilities.is_empty() {
+                String::new()
+            } else {
+                let c: Vec<String> = m
+                    .capabilities
+                    .iter()
+                    .map(|cap| format!("{:?}", cap).to_lowercase())
+                    .collect();
+                format!("（能力：{}）", c.join(", "))
+            };
+            format!("- {}/{}{}", m.provider, m.model, cap_str)
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
 const SYSTEM_PROMPT: &str = r#"
 你是 Agent，一个运行在 Telegram 聊天中的机器人成员。你使用软件工具与聊天中的其他成员通讯——就像人类使用聊天软件一样，你通过「工具」完成收发消息等操作。
 
@@ -247,6 +271,9 @@ https://search.bilibili.com/all?keyword={搜索词}
 - 可使用 `telegram_query_messages` 等工具翻阅历史。
 - 当前聊天ID：{chat_id}
 
+## 可用模型
+{available_models}
+
 # 附加要求
 {system_prompt}
 "#;
@@ -294,6 +321,7 @@ pub struct TriggerConfig {
     pub max_thread_length: usize,
     pub system_prompt: String,
     pub compact_prompt: String,
+    pub available_models: Vec<agent::ModelInfo>,
 }
 
 impl Default for TriggerConfig {
@@ -303,6 +331,7 @@ impl Default for TriggerConfig {
             max_thread_length: 100,
             system_prompt: "You are a helpful Telegram bot.".into(),
             compact_prompt: COMPACT_PROMPT.into(),
+            available_models: Vec::new(),
         }
     }
 }
@@ -498,11 +527,13 @@ async fn run_compact_and_turn(
                 .await
             {
                 if !summary.is_empty() && summary != "无" {
+                    let models_str = format_available_models(&config.available_models);
                     let full_system = format!(
                         "{}\n\n# 上一轮对话摘要\n{}",
                         SYSTEM_PROMPT
-                            .replace("{system_prompt}", &config.system_prompt)
-                            .replace("{chat_id}", &chat_id.0.to_string()),
+                            .replace("{chat_id}", &chat_id.0.to_string())
+                            .replace("{available_models}", &models_str)
+                            .replace("{system_prompt}", &config.system_prompt),
                         summary
                     );
                     agent
@@ -721,6 +752,7 @@ async fn resolve_thread(
 ) -> ResolveResult {
     let mut map = chat_map.write().await;
     let now = Utc::now();
+    let models_str = format_available_models(&config.available_models);
 
     match map.get_mut(&chat_id) {
         Some(entry) => {
@@ -735,8 +767,9 @@ async fn resolve_thread(
                     .append_system_message(
                         thread_id,
                         &SYSTEM_PROMPT
-                            .replace("{system_prompt}", &config.system_prompt)
-                            .replace("{chat_id}", &chat_id.0.to_string()),
+                            .replace("{chat_id}", &chat_id.0.to_string())
+                            .replace("{available_models}", &models_str)
+                            .replace("{system_prompt}", &config.system_prompt),
                     )
                     .await;
                 *entry = ThreadEntry {
@@ -765,8 +798,9 @@ async fn resolve_thread(
                 .append_system_message(
                     thread_id,
                     &SYSTEM_PROMPT
-                        .replace("{system_prompt}", &config.system_prompt)
-                        .replace("{chat_id}", &chat_id.0.to_string()),
+                        .replace("{chat_id}", &chat_id.0.to_string())
+                        .replace("{available_models}", &models_str)
+                        .replace("{system_prompt}", &config.system_prompt),
                 )
                 .await;
             map.insert(

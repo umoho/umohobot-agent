@@ -1,4 +1,4 @@
-use agent::{AgentError, AgentRuntime, CompletionModel};
+use agent::{AgentError, AgentRuntime};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -230,8 +230,8 @@ impl Tool for QueryMessagesByUserTool {
     }
 }
 
-pub async fn register_query_tools<M: CompletionModel + 'static>(
-    runtime: &AgentRuntime<M>,
+pub async fn register_query_tools(
+    runtime: &AgentRuntime,
     host: TelegramHost,
     cache: MessageCache,
 ) -> Result<(), AgentError> {

@@ -2,7 +2,7 @@ use uuid::Uuid;
 
 use rig_core::OneOrMany;
 use rig_core::completion::message::UserContent;
-use rig_core::completion::{CompletionModel, Message, Prompt};
+use rig_core::completion::{Message, Prompt};
 
 use crate::capability::Capability;
 use crate::error::AgentError;
@@ -34,7 +34,7 @@ pub trait AgentHandle: Send + Sync {
     fn capabilities(&self) -> &[Capability];
 }
 
-impl<M: CompletionModel + 'static> AgentHandle for AgentRuntime<M> {
+impl AgentHandle for AgentRuntime {
     fn run_turn<'a>(
         &'a self,
         thread_id: Uuid,

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use agent::{AgentError, AgentRuntime, SubagentStatus};
-use rig_core::completion::CompletionModel;
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -16,6 +15,7 @@ pub struct SubagentCreateArgs {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub tools: String,
+    pub model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,11 +43,11 @@ pub struct SubagentReadArgs {
 
 // ── Tool structs ──
 
-pub struct SubagentCreateTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentCreateTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
+impl Tool for SubagentCreateTool {
     const NAME: &'static str = "subagent_create";
 
     type Error = AgentError;
@@ -57,7 +57,7 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "subagent_create".into(),
-            description: "Create a sub-agent that can run tasks independently in the background. Optionally specify a system_prompt and tool whitelist (tools: \"all\", \"namespace_name\", or \"tool_name\"). The sub-agent inherits the parent's model. Returns a token needed for subsequent operations.".into(),
+            description: "Create a sub-agent that can run tasks independently in the background. Optionally specify a system_prompt, tool whitelist, and model. The sub-agent inherits the parent's model if omitted. Returns a token needed for subsequent operations.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -72,6 +72,10 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
                     "tools": {
                         "type": "string",
                         "description": "Tool whitelist: comma-separated tool names or namespaces (e.g. \"web_scrape,image_ocr\" or \"web\" or \"all\"). Empty means no tools."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model for the sub-agent, e.g. \"gpt-4o-mini\" or \"openai/gpt-4o-mini\". Inherits parent's model if omitted. Use subagent_status to see available models."
                     }
                 },
                 "required": ["name"]
@@ -82,7 +86,12 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
         let created = self
             .agent
-            .subagent_create(&args.name, args.system_prompt.as_deref(), &args.tools)
+            .subagent_create(
+                &args.name,
+                args.system_prompt.as_deref(),
+                &args.tools,
+                args.model.as_deref(),
+            )
             .await?;
         Ok(format!(
             "subagent '{}' created, token={}",
@@ -91,11 +100,11 @@ impl<M: CompletionModel + 'static> Tool for SubagentCreateTool<M> {
     }
 }
 
-pub struct SubagentAskTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentAskTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentAskTool<M> {
+impl Tool for SubagentAskTool {
     const NAME: &'static str = "subagent_ask";
 
     type Error = AgentError;
@@ -135,11 +144,11 @@ impl<M: CompletionModel + 'static> Tool for SubagentAskTool<M> {
     }
 }
 
-pub struct SubagentStopTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentStopTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentStopTool<M> {
+impl Tool for SubagentStopTool {
     const NAME: &'static str = "subagent_stop";
 
     type Error = AgentError;
@@ -173,11 +182,11 @@ impl<M: CompletionModel + 'static> Tool for SubagentStopTool<M> {
     }
 }
 
-pub struct SubagentStatusTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentStatusTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentStatusTool<M> {
+impl Tool for SubagentStatusTool {
     const NAME: &'static str = "subagent_status";
 
     type Error = AgentError;
@@ -220,11 +229,11 @@ impl<M: CompletionModel + 'static> Tool for SubagentStatusTool<M> {
     }
 }
 
-pub struct SubagentReadTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentReadTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentReadTool<M> {
+impl Tool for SubagentReadTool {
     const NAME: &'static str = "subagent_read";
 
     type Error = AgentError;
@@ -263,11 +272,11 @@ impl<M: CompletionModel + 'static> Tool for SubagentReadTool<M> {
     }
 }
 
-pub struct SubagentDestroyTool<M: CompletionModel> {
-    pub agent: Arc<AgentRuntime<M>>,
+pub struct SubagentDestroyTool {
+    pub agent: Arc<AgentRuntime>,
 }
 
-impl<M: CompletionModel + 'static> Tool for SubagentDestroyTool<M> {
+impl Tool for SubagentDestroyTool {
     const NAME: &'static str = "subagent_destroy";
 
     type Error = AgentError;
@@ -303,9 +312,7 @@ impl<M: CompletionModel + 'static> Tool for SubagentDestroyTool<M> {
 
 // ── Registration ──
 
-pub async fn register_subagent_tools(
-    agent: Arc<AgentRuntime<impl CompletionModel + 'static>>,
-) -> Result<(), AgentError> {
+pub async fn register_subagent_tools(agent: Arc<AgentRuntime>) -> Result<(), AgentError> {
     agent
         .register_tool(SubagentCreateTool {
             agent: agent.clone(),

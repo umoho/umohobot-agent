@@ -52,10 +52,10 @@ pub(crate) fn parse_dice_emoji(s: &str) -> Option<DiceEmoji> {
     }
 }
 
-use agent::{AgentError, AgentRuntime, CompletionModel};
+use agent::{AgentError, AgentRuntime};
 use telegram_host::{MessageCache, TelegramHost};
 pub async fn register_telegram_tools(
-    runtime: &AgentRuntime<impl CompletionModel + 'static>,
+    runtime: &AgentRuntime,
     host: TelegramHost,
     cache: MessageCache,
 ) -> Result<(), AgentError> {

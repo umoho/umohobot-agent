@@ -1,17 +1,32 @@
 use rig_core::agent::Agent;
 use rig_core::completion::CompletionModel;
+use serde::Deserialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
-#[derive(Clone)]
-pub struct ModelConfig {
+#[derive(Debug, Deserialize)]
+pub struct ConfigFile {
+    #[serde(rename = "default-model")]
+    pub default_model: String,
+    #[serde(rename = "model-accounts")]
+    pub model_accounts: Vec<ModelAccountEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModelAccountEntry {
+    pub provider: String,
     pub model: String,
+    #[serde(rename = "api-key")]
+    pub api_key: Option<String>,
+    #[serde(rename = "api-key-raw")]
+    pub api_key_raw: Option<String>,
+    #[serde(rename = "base-url")]
     pub base_url: Option<String>,
-    pub api_key: String,
-    pub max_turns: usize,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

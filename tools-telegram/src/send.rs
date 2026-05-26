@@ -1,5 +1,5 @@
 use crate::{ToolError, build_input_file, parse_dice_emoji};
-use agent::{AgentError, AgentRuntime, CompletionModel};
+use agent::{AgentError, AgentRuntime};
 use rig_core::completion::ToolDefinition;
 use rig_core::tool::Tool;
 use serde::Deserialize;
@@ -1025,8 +1025,8 @@ impl Tool for SendMediaGroupTool {
     }
 }
 
-pub async fn register_send_tools<M: CompletionModel + 'static>(
-    runtime: &AgentRuntime<M>,
+pub async fn register_send_tools(
+    runtime: &AgentRuntime,
     host: TelegramHost,
 ) -> Result<(), AgentError> {
     runtime

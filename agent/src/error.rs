@@ -4,6 +4,10 @@ pub enum AgentError {
     ThreadNotFound(uuid::Uuid),
     #[error("Model error: {0}")]
     ModelError(#[from] rig_core::completion::PromptError),
+    #[error("HTTP client error: {0}")]
+    HttpClient(#[from] rig_core::http_client::Error),
+    #[error("Model resolution: {0}")]
+    ModelResolution(String),
     #[error("Subagent '{name}' not found")]
     SubagentNotFound { name: String },
     #[error("Invalid subagent token")]
