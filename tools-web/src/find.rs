@@ -246,18 +246,26 @@ fn extract_context(text: &str, keyword: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
-    if let Some(pos) = text.find(keyword) {
+    let chars: Vec<char> = text.chars().collect();
+    let total_chars = chars.len();
+
+    if let Some(byte_pos) = text.find(keyword) {
+        let pos_in_chars = text[..byte_pos].chars().count();
+        let kw_chars = keyword.chars().count();
         let half = max_chars / 2;
-        let start = if pos > half { pos - half } else { 0 };
-        let end = (pos + keyword.len() + half).min(text.len());
-        let prefix = if start > 0 { "..." } else { "" };
-        let suffix = if end < text.len() { "..." } else { "" };
-        let snippet = &text[start..end];
+
+        let start_char = pos_in_chars.saturating_sub(half);
+        let end_char = (pos_in_chars + kw_chars + half).min(total_chars);
+
+        let prefix = if start_char > 0 { "..." } else { "" };
+        let suffix = if end_char < total_chars { "..." } else { "" };
+        let snippet: String = chars[start_char..end_char].iter().collect();
+
         format!("{prefix}{snippet}{suffix}")
     } else {
-        let end = max_chars.min(text.len());
-        let snippet = &text[..end];
-        let suffix = if end < text.len() { "..." } else { "" };
+        let end = max_chars.min(total_chars);
+        let snippet: String = chars[..end].iter().collect();
+        let suffix = if end < total_chars { "..." } else { "" };
         format!("{snippet}{suffix}")
     }
 }
