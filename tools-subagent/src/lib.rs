@@ -1,10 +1,32 @@
 use std::sync::Arc;
 
 use agent::{AgentError, AgentRuntime, SubagentStatus};
+use base64::Engine;
+use data_buffer::DataBuffer;
 use rig_core::completion::ToolDefinition;
+use rig_core::completion::message::{
+    AudioMediaType, ImageDetail, ImageMediaType, MimeType, UserContent,
+};
 use rig_core::tool::Tool;
 use serde::Deserialize;
 use serde_json::json;
+
+// ── Content part types ──
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ContentPart {
+    Text {
+        text: String,
+    },
+    Image {
+        buffer_key: String,
+        detail: Option<String>,
+    },
+    Audio {
+        buffer_key: String,
+    },
+}
 
 // ── Args ──
 
@@ -30,7 +52,7 @@ pub struct SubagentTokenNameArgs {
 pub struct SubagentAskArgs {
     pub token: String,
     pub name: String,
-    pub task: String,
+    pub content: Vec<ContentPart>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +124,7 @@ impl Tool for SubagentCreateTool {
 
 pub struct SubagentAskTool {
     pub agent: Arc<AgentRuntime>,
+    pub buffer: DataBuffer,
 }
 
 impl Tool for SubagentAskTool {
@@ -114,7 +137,7 @@ impl Tool for SubagentAskTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "subagent_ask".into(),
-            description: "Send a task to a sub-agent. If the sub-agent is idle, it starts running. If it's already running, returns an error. Use subagent_stop to interrupt the current task.".into(),
+            description: "Send a task to a sub-agent. Supports text, images, and audio via the content array. Use subagent_stop to interrupt the current task.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -126,19 +149,95 @@ impl Tool for SubagentAskTool {
                         "type": "string",
                         "description": "Name of the sub-agent"
                     },
-                    "task": {
-                        "type": "string",
-                        "description": "Task prompt for the sub-agent"
+                    "content": {
+                        "type": "array",
+                        "description": "Array of content parts. Each part has a 'type': 'text', 'image', or 'audio'.",
+                        "items": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["text"] },
+                                        "text": { "type": "string", "description": "Text content" }
+                                    },
+                                    "required": ["type", "text"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["image"] },
+                                        "bufferKey": { "type": "string", "description": "Buffer key from telegram_download or other buffer tools" },
+                                        "detail": { "type": "string", "enum": ["low", "high", "auto"], "description": "Optional image detail (default: auto)" }
+                                    },
+                                    "required": ["type", "bufferKey"]
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": { "type": "string", "enum": ["audio"] },
+                                        "bufferKey": { "type": "string", "description": "Buffer key from telegram_download or other buffer tools" }
+                                    },
+                                    "required": ["type", "bufferKey"]
+                                }
+                            ]
+                        }
                     }
                 },
-                "required": ["token", "name", "task"]
+                "required": ["token", "name", "content"]
             }),
         }
     }
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
+        let mut content = Vec::new();
+
+        for part in args.content {
+            match part {
+                ContentPart::Text { text } => {
+                    content.push(UserContent::text(text));
+                }
+                ContentPart::Image { buffer_key, detail } => {
+                    let bytes = self
+                        .buffer
+                        .get(&buffer_key)
+                        .ok_or_else(|| AgentError::BufferKeyNotFound(buffer_key.clone()))?;
+
+                    let mime = infer::get(&bytes)
+                        .ok_or_else(|| AgentError::MediaTypeDetectionFailed(buffer_key.clone()))?
+                        .mime_type()
+                        .to_string();
+
+                    let media_type = ImageMediaType::from_mime_type(&mime);
+                    let detail = match detail.as_deref() {
+                        Some("low") => ImageDetail::Low,
+                        Some("high") => ImageDetail::High,
+                        _ => ImageDetail::Auto,
+                    };
+
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    content.push(UserContent::image_base64(b64, media_type, Some(detail)));
+                }
+                ContentPart::Audio { buffer_key } => {
+                    let bytes = self
+                        .buffer
+                        .get(&buffer_key)
+                        .ok_or_else(|| AgentError::BufferKeyNotFound(buffer_key.clone()))?;
+
+                    let mime = infer::get(&bytes)
+                        .ok_or_else(|| AgentError::MediaTypeDetectionFailed(buffer_key.clone()))?
+                        .mime_type()
+                        .to_string();
+
+                    let media_type = AudioMediaType::from_mime_type(&mime);
+
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    content.push(UserContent::audio(b64, media_type));
+                }
+            }
+        }
+
         self.agent
-            .subagent_ask(&args.token, &args.name, &args.task)
+            .subagent_ask(&args.token, &args.name, content)
             .await?;
         Ok(format!("task submitted to subagent '{}'", args.name))
     }
@@ -312,7 +411,10 @@ impl Tool for SubagentDestroyTool {
 
 // ── Registration ──
 
-pub async fn register_subagent_tools(agent: Arc<AgentRuntime>) -> Result<(), AgentError> {
+pub async fn register_subagent_tools(
+    agent: Arc<AgentRuntime>,
+    buffer: DataBuffer,
+) -> Result<(), AgentError> {
     agent
         .register_tool(SubagentCreateTool {
             agent: agent.clone(),
@@ -321,6 +423,7 @@ pub async fn register_subagent_tools(agent: Arc<AgentRuntime>) -> Result<(), Age
     agent
         .register_tool(SubagentAskTool {
             agent: agent.clone(),
+            buffer,
         })
         .await?;
     agent

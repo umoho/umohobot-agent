@@ -22,4 +22,14 @@ pub enum AgentError {
     ToolServer(#[from] rig_core::tool::server::ToolServerError),
     #[error("Not in agent context")]
     NotInContext,
+    #[error("Buffer key not found: {0}")]
+    BufferKeyNotFound(String),
+    #[error("Subagent '{name}' does not support {required:?} capability (has {actual:?})")]
+    CapabilityMismatch {
+        name: String,
+        required: crate::Capability,
+        actual: Vec<crate::Capability>,
+    },
+    #[error("Failed to detect media type for buffer key '{0}'")]
+    MediaTypeDetectionFailed(String),
 }

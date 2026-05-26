@@ -7,6 +7,8 @@ use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
+use crate::Capability;
+
 #[derive(Debug, Deserialize)]
 pub struct ConfigFile {
     #[serde(rename = "default-model")]
@@ -47,6 +49,7 @@ pub struct SubagentEntry<M: CompletionModel> {
     pub token: String,
     pub thread_id: Uuid,
     pub agent: Agent<M>,
+    pub capabilities: Vec<Capability>,
     pub status: Arc<RwLock<SubagentStatus>>,
     pub task_abort: Arc<tokio::sync::Mutex<Option<AbortHandle>>>,
     pub results: Arc<RwLock<VecDeque<String>>>,
@@ -59,6 +62,7 @@ impl<M: CompletionModel + 'static> Clone for SubagentEntry<M> {
             token: self.token.clone(),
             thread_id: self.thread_id,
             agent: self.agent.clone(),
+            capabilities: self.capabilities.clone(),
             status: self.status.clone(),
             task_abort: self.task_abort.clone(),
             results: self.results.clone(),

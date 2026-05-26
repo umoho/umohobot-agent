@@ -1,6 +1,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
-    Vision,
+    Image,
     Audio,
 }
 
@@ -9,7 +9,7 @@ impl std::str::FromStr for Capability {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "vision" => Ok(Capability::Vision),
+            "image" => Ok(Capability::Image),
             "audio" => Ok(Capability::Audio),
             _ => Err(format!("Unknown capability: {s}")),
         }

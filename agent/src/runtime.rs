@@ -3,12 +3,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use rig_core::OneOrMany;
 use rig_core::agent::Agent;
 use rig_core::client::CompletionClient;
 use rig_core::completion::Message;
+use rig_core::completion::message::UserContent;
 use rig_core::providers::openai;
 use rig_core::tool::ToolDyn;
 
+use crate::Capability;
 use crate::dyn_tool::DynTool;
 use crate::error::AgentError;
 use crate::pool::{Account, ModelPool};
@@ -171,6 +174,7 @@ impl AgentRuntime {
             token: token.clone(),
             thread_id,
             agent: sub_agent,
+            capabilities: account.capabilities.clone(),
             status: Arc::new(RwLock::new(SubagentStatus::Idle)),
             task_abort: Arc::new(tokio::sync::Mutex::new(None)),
             results: Arc::new(RwLock::new(VecDeque::new())),
@@ -190,7 +194,7 @@ impl AgentRuntime {
         &self,
         token: &str,
         name: &str,
-        task: &str,
+        content: Vec<UserContent>,
     ) -> Result<(), AgentError> {
         let parent_id = CURRENT_PARENT_THREAD_ID
             .try_with(|id| *id)
@@ -209,6 +213,31 @@ impl AgentRuntime {
             return Err(AgentError::SubagentInvalidToken);
         }
 
+        // Check capabilities match content modalities
+        for item in &content {
+            match item {
+                UserContent::Image(_) => {
+                    if !entry.capabilities.contains(&Capability::Image) {
+                        return Err(AgentError::CapabilityMismatch {
+                            name: name.to_string(),
+                            required: Capability::Image,
+                            actual: entry.capabilities.clone(),
+                        });
+                    }
+                }
+                UserContent::Audio(_) => {
+                    if !entry.capabilities.contains(&Capability::Audio) {
+                        return Err(AgentError::CapabilityMismatch {
+                            name: name.to_string(),
+                            required: Capability::Audio,
+                            actual: entry.capabilities.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
         {
             let mut status = entry.status.write().await;
             if *status == SubagentStatus::Running {
@@ -225,16 +254,18 @@ impl AgentRuntime {
         let results = entry.results.clone();
         let status_arc = entry.status.clone();
         let abort_holder = entry.task_abort.clone();
-        let task_owned = task.to_string();
+
+        let message = Message::User {
+            content: OneOrMany::many(content).map_err(|_| {
+                AgentError::ModelError(rig_core::completion::PromptError::PromptCancelled {
+                    chat_history: vec![],
+                    reason: "empty content".into(),
+                })
+            })?,
+        };
 
         let handle = tokio::spawn(async move {
-            let result = run_turn_inner(
-                &sub_agent,
-                &threads,
-                sub_thread_id,
-                vec![Message::user(task_owned)],
-            )
-            .await;
+            let result = run_turn_inner(&sub_agent, &threads, sub_thread_id, vec![message]).await;
 
             match result {
                 Ok((text, _)) => {

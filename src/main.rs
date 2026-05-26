@@ -93,13 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let cache = MessageCache::new(200);
 
+    let data_buffer = DataBuffer::new();
+
     register_telegram_tools(agent_runtime.as_ref(), telegram_host.clone(), cache.clone()).await?;
 
     agent_runtime.register_tool(WebScrapeTool).await?;
     agent_runtime.register_tool(WebFetchTool).await?;
     agent_runtime.register_tool(WebFindTool).await?;
 
-    let data_buffer = DataBuffer::new();
     let ocr_backend = Box::new(OcrsBackend::new().await?);
     agent_runtime
         .register_tool(ImageOcrTool::new(ocr_backend, data_buffer.clone()))
@@ -108,11 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     agent_runtime
         .register_tool(TelegramDownloadTool {
             host: telegram_host.clone(),
-            buffer: data_buffer,
+            buffer: data_buffer.clone(),
         })
         .await?;
 
-    register_subagent_tools(agent_runtime.clone()).await?;
+    register_subagent_tools(agent_runtime.clone(), data_buffer.clone()).await?;
 
     let (expiry_tx, expiry_rx) = tokio::sync::mpsc::unbounded_channel::<TimerExpiry>();
     register_time_tools(agent_runtime.clone(), TimerConfig::default(), expiry_tx).await?;
