@@ -38,7 +38,7 @@ fn format_available_models(models: &[agent::ModelInfo]) -> String {
                     .iter()
                     .map(|cap| format!("{:?}", cap).to_lowercase())
                     .collect();
-                format!("\u{ff08}\u{80fd}\u{529b}\u{ff1a}{}\u{ff09}", c.join(", "))
+                format!("（能力：{}）", c.join(", "))
             };
             format!("- {}/{}{}", m.provider, m.model, cap_str)
         })
@@ -404,7 +404,7 @@ impl TelegramTrigger {
             let expiry_agent = agent.clone();
             tokio::spawn(async move {
                 while let Some(expiry) = rx.recv().await {
-                    let msg = format!("\u{23f0} Timer task: {}", expiry.task);
+                    let msg = format!("⏰ Timer task: {}", expiry.task);
                     if let Err(e) = expiry_agent
                         .run_turn(expiry.thread_id, vec![agent::Message::user(msg)])
                         .await

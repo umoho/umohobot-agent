@@ -46,12 +46,12 @@ pub(crate) fn ser_meta(meta: &MessageMeta) -> String {
 
 pub(crate) fn dice_emoji_str(e: &DiceEmoji) -> &'static str {
     match e {
-        DiceEmoji::Dice => "\u{1f3b2}",
-        DiceEmoji::Darts => "\u{1f3af}",
-        DiceEmoji::Bowling => "\u{1f3b3}",
-        DiceEmoji::Basketball => "\u{1f3c0}",
-        DiceEmoji::Football => "\u{26bd}",
-        DiceEmoji::SlotMachine => "\u{1f3b0}",
+        DiceEmoji::Dice => "🎲",
+        DiceEmoji::Darts => "🎯",
+        DiceEmoji::Bowling => "🎳",
+        DiceEmoji::Basketball => "🏀",
+        DiceEmoji::Football => "⚽",
+        DiceEmoji::SlotMachine => "🎰",
     }
 }
 
