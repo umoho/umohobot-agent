@@ -17,7 +17,8 @@ pub trait AgentHandle: Send + Sync {
         thread_id: Uuid,
         messages: Vec<Message>,
     ) -> BoxFuture<'a, Result<(String, Usage), AgentError>>;
-    fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread>;
+    fn create_thread<'a>(&'a self) -> BoxFuture<'a, Thread>;
+    fn get_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Option<Thread>>;
     fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
     fn set_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()>;
     fn get_thread_messages<'a>(
@@ -52,22 +53,19 @@ impl AgentHandle for AgentRuntime {
         })
     }
 
-    fn get_or_create_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Thread> {
+    fn create_thread<'a>(&'a self) -> BoxFuture<'a, Thread> {
         Box::pin(async move {
-            let threads = self.threads.read().await;
-            if let Some(thread) = threads.get(&id) {
-                return thread.clone();
-            }
-            drop(threads);
-
-            let mut threads = self.threads.write().await;
             let thread = Thread::new();
+            let id = thread.id;
             let clone = thread.clone();
-            threads.insert(id, thread);
-            drop(threads);
+            self.threads.write().await.insert(id, thread);
             self.persist_thread(id).await;
             clone
         })
+    }
+
+    fn get_thread<'a>(&'a self, id: Uuid) -> BoxFuture<'a, Option<Thread>> {
+        Box::pin(async move { self.threads.read().await.get(&id).cloned() })
     }
 
     fn append_system_message<'a>(&'a self, thread_id: Uuid, text: &'a str) -> BoxFuture<'a, ()> {

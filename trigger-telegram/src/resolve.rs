@@ -46,8 +46,8 @@ pub(crate) async fn resolve_thread(
 
             if expired {
                 let old_thread_id = entry.thread_id;
-                let thread_id = Uuid::new_v4();
-                agent.get_or_create_thread(thread_id).await;
+                let thread = agent.create_thread().await;
+                let thread_id = thread.id;
                 agent
                     .append_system_message(
                         thread_id,
@@ -77,8 +77,8 @@ pub(crate) async fn resolve_thread(
             }
         }
         None => {
-            let thread_id = Uuid::new_v4();
-            agent.get_or_create_thread(thread_id).await;
+            let thread = agent.create_thread().await;
+            let thread_id = thread.id;
             agent
                 .append_system_message(
                     thread_id,

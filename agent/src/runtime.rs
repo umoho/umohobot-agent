@@ -15,9 +15,9 @@ use rig_core::tool::ToolDyn;
 use crate::Capability;
 use crate::dyn_tool::DynTool;
 use crate::error::AgentError;
+use crate::handle::AgentHandle;
 use crate::pool::{Account, ModelPool};
 use crate::storage::Storage;
-use crate::thread::Thread;
 use crate::types::{CreatedSubagent, SubagentEntry, SubagentStatus};
 use crate::{CURRENT_PARENT_THREAD_ID, ThreadStore, run_turn_inner};
 
@@ -119,7 +119,8 @@ impl AgentRuntime {
             .await;
 
         let token = Uuid::new_v4().to_string();
-        let thread_id = Uuid::new_v4();
+        let thread = self.create_thread().await;
+        let thread_id = thread.id;
 
         let allowed = if tools.is_empty() {
             Vec::new()
@@ -160,7 +161,6 @@ impl AgentRuntime {
             .build();
         sub_agent.tool_server_handle = filtered;
 
-        self.get_or_create_thread(thread_id).await;
         if let Some(sp) = system_prompt {
             self.set_system_message(thread_id, sp).await;
         }
@@ -424,20 +424,6 @@ impl AgentRuntime {
         self.subagents.write().await.remove(&key);
 
         Ok(())
-    }
-
-    pub(crate) async fn get_or_create_thread(&self, id: Uuid) -> Thread {
-        let threads = self.threads.read().await;
-        if let Some(thread) = threads.get(&id) {
-            return thread.clone();
-        }
-        drop(threads);
-
-        let mut threads = self.threads.write().await;
-        let thread = Thread::new();
-        let clone = thread.clone();
-        threads.insert(id, thread);
-        clone
     }
 
     pub(crate) async fn set_system_message(&self, thread_id: Uuid, text: &str) {
