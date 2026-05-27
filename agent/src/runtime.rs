@@ -91,6 +91,7 @@ impl AgentRuntime {
         }
         drop(threads);
         self.persist_thread(thread_id).await;
+        self.threads.write().await.remove(&thread_id);
     }
 
     pub async fn subagent_create(

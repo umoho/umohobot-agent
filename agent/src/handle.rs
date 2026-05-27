@@ -140,6 +140,7 @@ impl AgentHandle for AgentRuntime {
 
             self.persist_thread(old_thread_id).await;
             self.persist_thread(new_thread_id).await;
+            self.threads.write().await.remove(&old_thread_id);
 
             Ok(response.output)
         })
