@@ -6,6 +6,7 @@ mod handle;
 mod pool;
 mod run_turn;
 mod runtime;
+pub mod storage;
 mod thread;
 mod types;
 
@@ -18,6 +19,7 @@ pub use pool::{Account, ModelInfo, ModelPool};
 pub use rig_core::completion::Usage;
 pub(crate) use run_turn::run_turn_inner;
 pub use runtime::AgentRuntime;
+pub use storage::{Storage, StorageResult, file::FileStorage};
 pub use thread::Thread;
 pub use types::{ConfigFile, CreatedSubagent, ModelAccountEntry, SubagentEntry, SubagentStatus};
 

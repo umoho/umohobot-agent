@@ -41,12 +41,14 @@ impl AgentHandle for AgentRuntime {
         messages: Vec<Message>,
     ) -> BoxFuture<'a, Result<(String, Usage), AgentError>> {
         Box::pin(async move {
-            CURRENT_PARENT_THREAD_ID
+            let result = CURRENT_PARENT_THREAD_ID
                 .scope(
                     thread_id,
                     run_turn_inner(&self.agent, &self.threads, thread_id, messages),
                 )
-                .await
+                .await;
+            self.persist_thread(thread_id).await;
+            result
         })
     }
 
@@ -62,6 +64,8 @@ impl AgentHandle for AgentRuntime {
             let thread = Thread::new();
             let clone = thread.clone();
             threads.insert(id, thread);
+            drop(threads);
+            self.persist_thread(id).await;
             clone
         })
     }
@@ -72,6 +76,8 @@ impl AgentHandle for AgentRuntime {
             if let Some(thread) = threads.get_mut(&thread_id) {
                 thread.messages.push(Message::system(text));
             }
+            drop(threads);
+            self.persist_thread(thread_id).await;
         })
     }
 
@@ -89,6 +95,8 @@ impl AgentHandle for AgentRuntime {
                     thread.messages.push(Message::system(text));
                 }
             }
+            drop(threads);
+            self.persist_thread(thread_id).await;
         })
     }
 
@@ -131,6 +139,9 @@ impl AgentHandle for AgentRuntime {
                     new.prev_thread_id = Some(old_thread_id);
                 }
             }
+
+            self.persist_thread(old_thread_id).await;
+            self.persist_thread(new_thread_id).await;
 
             Ok(response.output)
         })

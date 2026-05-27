@@ -1,19 +1,27 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent::{AgentHandle, Message, OneOrMany, UserContent};
-use chrono::{DateTime, Duration, Utc};
+use chrono::Duration;
 use dptree;
 use telegram_host::{MessageCache, TelegramHost};
-use teloxide::dispatching::UpdateFilterExt;
 use teloxide::prelude::*;
-use teloxide::types::{ChatId, DiceEmoji, Message as TgMessage, Update};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use teloxide::types::{Update, UpdateKind};
+use tokio::sync::{Mutex, mpsc};
 use tools_time::TimerExpiry;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::info;
 
+mod chat_worker;
 mod compact_format;
+mod message_format;
+mod resolve;
+mod update_handler;
+
+pub use compact_format::format_for_compact;
+
+use chat_worker::ChatSenders;
+use resolve::ChatMap;
+use update_handler::handle_root_update;
 
 fn format_available_models(models: &[agent::ModelInfo]) -> String {
     if models.is_empty() {
@@ -30,7 +38,7 @@ fn format_available_models(models: &[agent::ModelInfo]) -> String {
                     .iter()
                     .map(|cap| format!("{:?}", cap).to_lowercase())
                     .collect();
-                format!("（能力：{}）", c.join(", "))
+                format!("\u{ff08}\u{80fd}\u{529b}\u{ff1a}{}\u{ff09}", c.join(", "))
             };
             format!("- {}/{}{}", m.provider, m.model, cap_str)
         })
@@ -39,7 +47,7 @@ fn format_available_models(models: &[agent::ModelInfo]) -> String {
     lines.join("\n")
 }
 
-const SYSTEM_PROMPT: &str = r#"
+pub(crate) const SYSTEM_PROMPT: &str = r#"
 你是 Agent，一个运行在 Telegram 聊天中的机器人成员。你使用软件工具与聊天中的其他成员通讯——就像人类使用聊天软件一样，你通过「工具」完成收发消息等操作。
 
 你收到的每条 role=user 的消息并非来自用户直接输入，而是 Trigger 系统将 Telegram 中的聊天事件（新消息、图片等）转换后的上下文快照。你可以把这当作 Telegram 的「事件推送」来阅读，并通过工具做出回应。
@@ -293,7 +301,7 @@ https://search.bilibili.com/all?keyword={搜索词}
 {system_prompt}
 "#;
 
-const COMPACT_PROMPT: &str = r#"
+pub(crate) const COMPACT_PROMPT: &str = r#"
 你是对话分析师，负责在群聊/私聊会话切换时继承上下文。
 
 对话中每行的格式：
@@ -351,45 +359,34 @@ impl Default for TriggerConfig {
     }
 }
 
-struct ThreadEntry {
-    thread_id: Uuid,
-    last_activity: DateTime<Utc>,
-    message_count: usize,
-}
-
-type ChatMap = Arc<RwLock<HashMap<ChatId, ThreadEntry>>>;
-
-type ChatSenders = Arc<Mutex<HashMap<ChatId, mpsc::UnboundedSender<TgMessage>>>>;
-
-struct ResolveResult {
-    thread_id: Uuid,
-    old_thread_id: Option<Uuid>,
-}
-
 pub struct TelegramTrigger {
     host: TelegramHost,
-    agent: Arc<dyn AgentHandle>,
+    agent: Arc<dyn agent::AgentHandle>,
     config: TriggerConfig,
     chat_map: ChatMap,
     cache: MessageCache,
-    expiry_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TimerExpiry>>,
+    expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
+    telegram_dir: PathBuf,
 }
 
 impl TelegramTrigger {
     pub fn new(
         host: TelegramHost,
-        agent: Arc<dyn AgentHandle>,
+        agent: Arc<dyn agent::AgentHandle>,
         config: TriggerConfig,
         cache: MessageCache,
-        expiry_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TimerExpiry>>,
+        expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
+        telegram_dir: PathBuf,
     ) -> Self {
+        std::fs::create_dir_all(telegram_dir.join("updates")).ok();
         Self {
             host,
             agent,
             config,
+            chat_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             cache,
-            chat_map: Arc::new(RwLock::new(HashMap::new())),
             expiry_rx,
+            telegram_dir,
         }
     }
 
@@ -401,25 +398,35 @@ impl TelegramTrigger {
         let cache = self.cache;
         let host = self.host;
         let chat_senders: ChatSenders = Arc::new(Mutex::new(HashMap::new()));
+        let telegram_dir = self.telegram_dir;
 
         if let Some(mut rx) = self.expiry_rx {
             let expiry_agent = agent.clone();
             tokio::spawn(async move {
                 while let Some(expiry) = rx.recv().await {
-                    let msg = format!("⏰ Timer task: {}", expiry.task);
+                    let msg = format!("\u{23f0} Timer task: {}", expiry.task);
                     if let Err(e) = expiry_agent
-                        .run_turn(expiry.thread_id, vec![Message::user(msg)])
+                        .run_turn(expiry.thread_id, vec![agent::Message::user(msg)])
                         .await
                     {
-                        warn!("timer trigger failed: {e}");
+                        tracing::warn!("timer trigger failed: {e}");
                     }
                 }
             });
         }
 
-        let handler = Update::filter_message().endpoint(handle_message);
+        let handler = dptree::filter(|upd: Update| matches!(upd.kind, UpdateKind::Message(_)))
+            .endpoint(handle_root_update);
 
-        let dependencies = dptree::deps![agent, config, chat_map, cache, host, chat_senders];
+        let dependencies = dptree::deps![
+            agent,
+            config,
+            chat_map,
+            cache,
+            host,
+            chat_senders,
+            telegram_dir
+        ];
 
         info!("starting Telegram bot dispatcher");
         Dispatcher::builder(bot, handler)
@@ -429,408 +436,5 @@ impl TelegramTrigger {
             .await;
 
         Ok(())
-    }
-}
-
-async fn handle_message(
-    msg: TgMessage,
-    agent: Arc<dyn AgentHandle>,
-    config: Arc<TriggerConfig>,
-    chat_map: ChatMap,
-    cache: MessageCache,
-    host: TelegramHost,
-    chat_senders: ChatSenders,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    cache.push(msg.clone()).await;
-
-    dispatch_to_worker(msg, chat_senders, agent, config, chat_map, host, cache).await;
-
-    Ok(())
-}
-
-async fn dispatch_to_worker(
-    msg: TgMessage,
-    chat_senders: ChatSenders,
-    agent: Arc<dyn AgentHandle>,
-    config: Arc<TriggerConfig>,
-    chat_map: ChatMap,
-    host: TelegramHost,
-    cache: MessageCache,
-) {
-    let chat_id = msg.chat.id;
-    let mut map = chat_senders.lock().await;
-
-    if let Some(sender) = map.get(&chat_id) {
-        let _ = sender.send(msg);
-    } else {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _ = tx.send(msg);
-        map.insert(chat_id, tx);
-
-        tokio::spawn(chat_worker(
-            chat_id, rx, agent, config, chat_map, host, cache,
-        ));
-    }
-}
-
-async fn chat_worker(
-    chat_id: ChatId,
-    mut rx: mpsc::UnboundedReceiver<TgMessage>,
-    agent: Arc<dyn AgentHandle>,
-    config: Arc<TriggerConfig>,
-    chat_map: ChatMap,
-    _host: TelegramHost,
-    _cache: MessageCache,
-) {
-    loop {
-        let Some(first) = rx.recv().await else {
-            return;
-        };
-
-        let mut batch = vec![first];
-        while let Ok(msg) = rx.try_recv() {
-            batch.push(msg);
-        }
-
-        let mut agent_messages = Vec::new();
-        for msg in &batch {
-            let raw_text = msg
-                .text()
-                .or_else(|| msg.caption())
-                .unwrap_or("")
-                .to_owned();
-            match build_user_content(msg, &raw_text) {
-                Ok(content) if !content.is_empty() => {
-                    agent_messages.push(Message::User { content });
-                }
-                _ => warn!(%chat_id, "skipping empty message in batch"),
-            }
-        }
-
-        if agent_messages.is_empty() {
-            continue;
-        }
-
-        let batch_len = agent_messages.len();
-
-        if batch_len > config.max_thread_length as usize {
-            for chunk in agent_messages.chunks(config.max_thread_length) {
-                let resolve =
-                    resolve_thread(chat_id, &chat_map, &*agent, &config, chunk.len()).await;
-                run_compact_and_turn(chat_id, resolve, chunk.to_vec(), &*agent, &config).await;
-            }
-            continue;
-        }
-
-        let resolve = resolve_thread(chat_id, &chat_map, &*agent, &config, batch_len).await;
-        run_compact_and_turn(chat_id, resolve, agent_messages, &*agent, &config).await;
-    }
-}
-
-async fn run_compact_and_turn(
-    chat_id: ChatId,
-    resolve: ResolveResult,
-    agent_messages: Vec<Message>,
-    agent: &dyn AgentHandle,
-    config: &TriggerConfig,
-) {
-    if let Some(old_id) = resolve.old_thread_id {
-        if let Ok(msgs) = agent.get_thread_messages(old_id).await {
-            let text = compact_format::format_for_compact(&msgs);
-            if let Ok(summary) = agent
-                .compact_thread(&text, old_id, resolve.thread_id, &config.compact_prompt)
-                .await
-            {
-                if !summary.is_empty() && summary != "无" {
-                    let models_str = format_available_models(&config.available_models);
-                    let full_system = format!(
-                        "{}\n\n# 上一轮对话摘要\n{}",
-                        SYSTEM_PROMPT
-                            .replace("{chat_id}", &chat_id.0.to_string())
-                            .replace("{available_models}", &models_str)
-                            .replace("{system_prompt}", &config.system_prompt),
-                        summary
-                    );
-                    agent
-                        .set_system_message(resolve.thread_id, &full_system)
-                        .await;
-                }
-            }
-        }
-    }
-
-    match agent.run_turn(resolve.thread_id, agent_messages).await {
-        Ok((text, _usage)) => {
-            if !text.is_empty() {
-                debug!(%chat_id, "agent response: {text}");
-            }
-        }
-        Err(e) => {
-            error!(%chat_id, error = %e, "agent error");
-        }
-    }
-}
-
-#[derive(serde::Serialize)]
-struct MessageMeta {
-    chat_id: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    username: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_name: Option<String>,
-    r#type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    media_group_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    emoji: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    width: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    height: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    duration: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    performer: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<i64>,
-    msg_id: i64,
-}
-
-fn ser_meta(meta: &MessageMeta) -> String {
-    let json = serde_json::to_string(meta).unwrap_or_default();
-    format!("\x1E{}\x1E ", json)
-}
-
-fn dice_emoji_str(e: &DiceEmoji) -> &'static str {
-    match e {
-        DiceEmoji::Dice => "🎲",
-        DiceEmoji::Darts => "🎯",
-        DiceEmoji::Bowling => "🎳",
-        DiceEmoji::Basketball => "🏀",
-        DiceEmoji::Football => "⚽",
-        DiceEmoji::SlotMachine => "🎰",
-    }
-}
-
-fn build_user_content(
-    msg: &TgMessage,
-    raw_text: &str,
-) -> Result<OneOrMany<UserContent>, Box<dyn std::error::Error + Send + Sync>> {
-    let chat_id = msg.chat.id.0;
-    let msg_id = msg.id.0 as i64;
-    let media_group_id = msg.media_group_id().map(|g| g.0.clone());
-    let reply_to = msg.reply_to_message().as_ref().map(|r| r.id.0 as i64);
-    let (user_id, username, first_name) = match msg.from.as_ref() {
-        Some(u) => {
-            let username = u.username.clone().map(|n| format!("@{}", n));
-            (Some(u.id.0), username, Some(u.first_name.clone()))
-        }
-        None => (None, None, None),
-    };
-
-    let base = MessageMeta {
-        chat_id,
-        user_id,
-        username,
-        first_name,
-        r#type: String::new(),
-        media_group_id,
-        emoji: None,
-        value: None,
-        width: None,
-        height: None,
-        duration: None,
-        performer: None,
-        title: None,
-        file_name: None,
-        mime_type: None,
-        file_id: None,
-        reply_to,
-        msg_id,
-    };
-
-    if let Some(sticker) = msg.sticker() {
-        let mut meta = base;
-        meta.r#type = "sticker".into();
-        meta.file_id = Some(sticker.file.id.to_string());
-        meta.emoji = sticker.emoji.clone();
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(photos) = msg.photo() {
-        if let Some(p) = photos.last() {
-            let mut meta = base;
-            meta.r#type = "photo".into();
-            meta.file_id = Some(p.file.id.to_string());
-            meta.width = Some(p.width as u32);
-            meta.height = Some(p.height as u32);
-            return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-        }
-    }
-
-    if let Some(video) = msg.video() {
-        let mut meta = base;
-        meta.r#type = "video".into();
-        meta.file_id = Some(video.file.id.to_string());
-        meta.width = Some(video.width);
-        meta.height = Some(video.height);
-        meta.duration = Some(video.duration.seconds());
-        meta.file_name = video.file_name.clone();
-        meta.mime_type = video.mime_type.as_ref().map(|m| m.to_string());
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(audio) = msg.audio() {
-        let mut meta = base;
-        meta.r#type = "audio".into();
-        meta.file_id = Some(audio.file.id.to_string());
-        meta.duration = Some(audio.duration.seconds());
-        meta.performer = audio.performer.clone();
-        meta.title = audio.title.clone();
-        meta.file_name = audio.file_name.clone();
-        meta.mime_type = audio.mime_type.as_ref().map(|m| m.to_string());
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(doc) = msg.document() {
-        let mut meta = base;
-        meta.r#type = "document".into();
-        meta.file_id = Some(doc.file.id.to_string());
-        meta.file_name = doc.file_name.clone();
-        meta.mime_type = doc.mime_type.as_ref().map(|m| m.to_string());
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(anim) = msg.animation() {
-        let mut meta = base;
-        meta.r#type = "animation".into();
-        meta.file_id = Some(anim.file.id.to_string());
-        meta.width = Some(anim.width);
-        meta.height = Some(anim.height);
-        meta.duration = Some(anim.duration.seconds());
-        meta.file_name = anim.file_name.clone();
-        meta.mime_type = anim.mime_type.as_ref().map(|m| m.to_string());
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(voice) = msg.voice() {
-        let mut meta = base;
-        meta.r#type = "voice".into();
-        meta.file_id = Some(voice.file.id.to_string());
-        meta.duration = Some(voice.duration.seconds());
-        meta.mime_type = voice.mime_type.as_ref().map(|m| m.to_string());
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if let Some(dice) = msg.dice() {
-        let mut meta = base;
-        meta.r#type = "dice".into();
-        meta.emoji = Some(dice_emoji_str(&dice.emoji).to_string());
-        meta.value = Some(dice.value as i32);
-        return Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))));
-    }
-
-    if !raw_text.trim().is_empty() {
-        let mut meta = base;
-        meta.r#type = "text".into();
-        return Ok(OneOrMany::one(UserContent::text(format!(
-            "{}{}",
-            ser_meta(&meta),
-            raw_text
-        ))));
-    }
-
-    let mut meta = base;
-    meta.r#type = "unsupported".into();
-    warn!("message has no supported type");
-    Ok(OneOrMany::one(UserContent::text(ser_meta(&meta))))
-}
-
-async fn resolve_thread(
-    chat_id: ChatId,
-    chat_map: &ChatMap,
-    agent: &dyn AgentHandle,
-    config: &TriggerConfig,
-    batch_len: usize,
-) -> ResolveResult {
-    let mut map = chat_map.write().await;
-    let now = Utc::now();
-    let models_str = format_available_models(&config.available_models);
-
-    match map.get_mut(&chat_id) {
-        Some(entry) => {
-            let expired = now - entry.last_activity > config.idle_timeout
-                || entry.message_count + batch_len > config.max_thread_length;
-
-            if expired {
-                let old_thread_id = entry.thread_id;
-                let thread_id = Uuid::new_v4();
-                agent.get_or_create_thread(thread_id).await;
-                agent
-                    .append_system_message(
-                        thread_id,
-                        &SYSTEM_PROMPT
-                            .replace("{chat_id}", &chat_id.0.to_string())
-                            .replace("{available_models}", &models_str)
-                            .replace("{system_prompt}", &config.system_prompt),
-                    )
-                    .await;
-                *entry = ThreadEntry {
-                    thread_id,
-                    last_activity: now,
-                    message_count: batch_len,
-                };
-                info!(%chat_id, %thread_id, "new thread (expired)");
-                ResolveResult {
-                    thread_id,
-                    old_thread_id: Some(old_thread_id),
-                }
-            } else {
-                entry.last_activity = now;
-                entry.message_count += batch_len;
-                ResolveResult {
-                    thread_id: entry.thread_id,
-                    old_thread_id: None,
-                }
-            }
-        }
-        None => {
-            let thread_id = Uuid::new_v4();
-            agent.get_or_create_thread(thread_id).await;
-            agent
-                .append_system_message(
-                    thread_id,
-                    &SYSTEM_PROMPT
-                        .replace("{chat_id}", &chat_id.0.to_string())
-                        .replace("{available_models}", &models_str)
-                        .replace("{system_prompt}", &config.system_prompt),
-                )
-                .await;
-            map.insert(
-                chat_id,
-                ThreadEntry {
-                    thread_id,
-                    last_activity: now,
-                    message_count: batch_len,
-                },
-            );
-            info!(%chat_id, %thread_id, "new thread (first message)");
-            ResolveResult {
-                thread_id,
-                old_thread_id: None,
-            }
-        }
     }
 }

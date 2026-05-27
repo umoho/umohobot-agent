@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent::{AgentBuilder, ConfigFile, ModelPool};
+use agent::{AgentBuilder, ConfigFile, FileStorage, ModelPool, Storage};
 use data_buffer::DataBuffer;
 use telegram_host::{MessageCache, TelegramHost};
 use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
@@ -74,8 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .allocate(Uuid::new_v4(), &default_provider, &default_model_name)
         .await;
 
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new("data"));
+
     let agent_runtime = Arc::new(
         AgentBuilder::new()
+            .storage(storage.clone())
             .max_turns(cli.max_turns)
             .build(&default_account, model_pool.clone())?,
     );
@@ -132,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config,
         cache,
         Some(expiry_rx),
+        "data/telegram".into(),
     );
 
     trigger.start().await

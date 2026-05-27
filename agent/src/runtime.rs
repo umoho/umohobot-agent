@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 use rig_core::OneOrMany;
@@ -15,6 +16,7 @@ use crate::Capability;
 use crate::dyn_tool::DynTool;
 use crate::error::AgentError;
 use crate::pool::{Account, ModelPool};
+use crate::storage::Storage;
 use crate::thread::Thread;
 use crate::types::{CreatedSubagent, SubagentEntry, SubagentStatus};
 use crate::{CURRENT_PARENT_THREAD_ID, ThreadStore, run_turn_inner};
@@ -30,6 +32,7 @@ pub struct AgentRuntime {
     pub(crate) model_pool: Arc<ModelPool>,
     pub parent_account: Arc<Account>,
     pub(crate) max_turns: usize,
+    pub(crate) storage: Option<Arc<dyn Storage>>,
 }
 
 impl AgentRuntime {
@@ -49,6 +52,7 @@ impl AgentRuntime {
             model_pool,
             parent_account,
             max_turns,
+            storage: None,
         }
     }
 
@@ -85,6 +89,8 @@ impl AgentRuntime {
         if let Some(thread) = threads.get_mut(&thread_id) {
             thread.close();
         }
+        drop(threads);
+        self.persist_thread(thread_id).await;
     }
 
     pub async fn subagent_create(
@@ -168,6 +174,8 @@ impl AgentRuntime {
                 child.parent_thread_id = Some(parent_id);
             }
         }
+        self.persist_thread(parent_id).await;
+        self.persist_thread(thread_id).await;
 
         let entry = SubagentEntry {
             name: name.to_string(),
@@ -443,6 +451,17 @@ impl AgentRuntime {
                 thread.messages[idx] = Message::system(text);
             } else {
                 thread.messages.push(Message::system(text));
+            }
+        }
+    }
+
+    pub(crate) async fn persist_thread(&self, id: Uuid) {
+        if let Some(ref storage) = self.storage {
+            let threads = self.threads.read().await;
+            if let Some(thread) = threads.get(&id) {
+                if let Err(e) = storage.save_thread(thread).await {
+                    warn!(thread_id = %id, error = %e, "failed to persist thread");
+                }
             }
         }
     }

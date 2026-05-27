@@ -5,10 +5,12 @@ use rig_core::providers::openai;
 
 use crate::pool::{Account, ModelPool};
 use crate::runtime::AgentRuntime;
+use crate::storage::Storage;
 
 pub struct AgentBuilder {
     preamble: Option<String>,
     max_turns: Option<usize>,
+    storage: Option<Arc<dyn Storage>>,
 }
 
 impl AgentBuilder {
@@ -16,6 +18,7 @@ impl AgentBuilder {
         Self {
             preamble: None,
             max_turns: Some(10),
+            storage: None,
         }
     }
 
@@ -31,6 +34,11 @@ impl AgentBuilder {
 
     pub fn max_turns(mut self, turns: usize) -> Self {
         self.max_turns = Some(turns);
+        self
+    }
+
+    pub fn storage(mut self, storage: Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -51,12 +59,16 @@ impl AgentBuilder {
         }
         let agent = agent_builder.default_max_turns(max_turns).build();
 
-        Ok(AgentRuntime::new(
+        let mut runtime = AgentRuntime::new(
             agent,
             account.capabilities.clone(),
             model_pool,
             Arc::new(account.clone()),
             max_turns,
-        ))
+        );
+        if let Some(storage) = self.storage {
+            runtime.storage = Some(storage);
+        }
+        Ok(runtime)
     }
 }
