@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent::{AgentHandle, Message};
+use telegram_host::{ThreadChatMap, UpdateStore};
 use teloxide::types::{ChatId, Message as TgMessage};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -23,6 +24,8 @@ pub(crate) async fn dispatch_to_worker(
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
     telegram_dir: PathBuf,
+    thread_chat_map: ThreadChatMap,
+    updates: UpdateStore,
 ) {
     let chat_id = msg.chat.id;
     let map = chat_senders.lock().await;
@@ -44,6 +47,8 @@ pub(crate) async fn dispatch_to_worker(
         config,
         chat_map,
         telegram_dir,
+        thread_chat_map,
+        updates,
     ));
 }
 
@@ -54,6 +59,8 @@ async fn chat_worker(
     config: Arc<TriggerConfig>,
     chat_map: ChatMap,
     telegram_dir: PathBuf,
+    thread_chat_map: ThreadChatMap,
+    _updates: UpdateStore,
 ) {
     let system_prompt = crate::SYSTEM_PROMPT.to_owned();
     let models_str = format_available_models(&config.available_models);
@@ -99,6 +106,7 @@ async fn chat_worker(
                     &*agent,
                     &config,
                     chunk.len(),
+                    &thread_chat_map,
                 )
                 .await;
                 save_chat_map(&telegram_dir, &chat_map).await;
@@ -124,6 +132,7 @@ async fn chat_worker(
             &*agent,
             &config,
             batch_len,
+            &thread_chat_map,
         )
         .await;
         save_chat_map(&telegram_dir, &chat_map).await;

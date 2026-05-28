@@ -5,6 +5,7 @@ use std::sync::Arc;
 use agent::AgentHandle;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use telegram_host::ThreadChatMap;
 use teloxide::types::ChatId;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -34,11 +35,12 @@ pub(crate) async fn resolve_thread(
     agent: &dyn AgentHandle,
     config: &TriggerConfig,
     batch_len: usize,
+    thread_chat_map: &ThreadChatMap,
 ) -> ResolveResult {
     let mut map = chat_map.write().await;
     let now = Utc::now();
 
-    match map.get_mut(&chat_id) {
+    let result = match map.get_mut(&chat_id) {
         Some(entry) => {
             let expired = now - entry.last_activity > config.idle_timeout
                 || entry.message_count + batch_len > config.max_thread_length;
@@ -101,7 +103,14 @@ pub(crate) async fn resolve_thread(
                 old_thread_id: None,
             }
         }
-    }
+    };
+
+    thread_chat_map
+        .write()
+        .await
+        .insert(result.thread_id, chat_id.0);
+
+    result
 }
 
 pub(crate) async fn save_chat_map(telegram_dir: &Path, chat_map: &ChatMap) {

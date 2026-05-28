@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use chrono::Duration;
 use dptree;
-use telegram_host::{MessageCache, TelegramHost};
+use telegram_host::{MessageCache, TelegramHost, ThreadChatMap, UpdateStore};
 use teloxide::prelude::*;
 use teloxide::types::{Update, UpdateKind};
 use tokio::sync::{Mutex, mpsc};
@@ -87,11 +87,10 @@ pub(crate) const SYSTEM_PROMPT: &str = r#"
 ### 互动
 - `telegram_setMessageReaction` — 对消息设置表情回应，reaction 传 JSON 数组如 `[{"type":"emoji","emoji":"👍"}]`
 
-### 查询历史（本地缓存，仅限当前会话收到的消息）
-- `telegram_query_message` — 按 ID 查询单条消息
-- `telegram_query_messages` — 列出最近消息（支持分页、limit）
-- `telegram_query_search` — 全文搜索消息
-- `telegram_query_messages_by_user` — 按用户筛选消息
+### 查询历史（本地持久化，当前聊天的完整历史）
+- `telegram_query_list` — 列出最近消息（支持分页）
+- `telegram_query_find` — 搜索消息历史（关键词、用户、类型、时间范围），返回轻量定位信息
+- `telegram_query_read` — 按 ID 精确读取消息详情，支持字段筛选
 
 ### 文件下载
 - `telegram_download` — 通过 file_id 下载 Telegram 文件到共享缓冲区，返回 buffer_key，可传递给 `image_ocr` 等工具处理
@@ -291,7 +290,7 @@ https://search.bilibili.com/all?keyword={搜索词}
 # 聊天上下文
 - 你是聊天中的普通成员，通过 Telegram 工具与其他人交流。
 - 可能有多个聊天成员参与（群聊），区分不同聊天成员并参考历史消息回答。
-- 可使用 `telegram_query_messages` 等工具翻阅历史。
+- 可使用 `telegram_query_list`、`telegram_query_find` 等工具翻阅历史。
 - 当前聊天ID：{chat_id}
 
 ## 可用模型
@@ -357,6 +356,80 @@ impl Default for TriggerConfig {
     }
 }
 
+async fn load_updates(telegram_dir: &PathBuf) -> UpdateStore {
+    let store: UpdateStore = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+    let dir = tokio::fs::read_dir(telegram_dir).await;
+    let Ok(mut dir) = dir else {
+        return store;
+    };
+
+    let mut entries = Vec::new();
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        entries.push(entry);
+    }
+
+    let mut load_tasks = Vec::new();
+    for entry in entries {
+        let dir_name = entry.file_name();
+        let name = dir_name.to_string_lossy();
+        if !name.starts_with("chat-")
+            || !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+        {
+            continue;
+        }
+        let chat_id_str = name.strip_prefix("chat-").unwrap_or("");
+        let Ok(chat_id) = chat_id_str.parse::<i64>() else {
+            continue;
+        };
+
+        let path = entry.path();
+        let store_clone = store.clone();
+        load_tasks.push(tokio::spawn(async move {
+            let mut dir_reader = match tokio::fs::read_dir(&path).await {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let mut batch = Vec::new();
+            while let Ok(Some(file)) = dir_reader.next_entry().await {
+                let fname = file.file_name();
+                let fname = fname.to_string_lossy();
+                if !fname.starts_with("update-") || !fname.ends_with(".json") {
+                    continue;
+                }
+                let update_id_str = fname
+                    .strip_prefix("update-")
+                    .and_then(|s| s.strip_suffix(".json"))
+                    .unwrap_or("");
+                let Ok(update_id) = update_id_str.parse::<i64>() else {
+                    continue;
+                };
+                let content = match tokio::fs::read_to_string(file.path()).await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let value: serde_json::Value = match serde_json::from_str(&content) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                batch.push((update_id, value));
+            }
+
+            batch.sort_by_key(|(id, _)| *id);
+
+            let mut store = store_clone.write().await;
+            store.insert(chat_id, batch);
+        }));
+    }
+
+    for task in load_tasks {
+        let _ = task.await;
+    }
+
+    info!("loaded updates for {} chats", store.read().await.len());
+
+    store
+}
+
 pub struct TelegramTrigger {
     host: TelegramHost,
     agent: Arc<dyn agent::AgentHandle>,
@@ -365,6 +438,8 @@ pub struct TelegramTrigger {
     cache: MessageCache,
     expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
     telegram_dir: PathBuf,
+    thread_chat_map: ThreadChatMap,
+    updates: UpdateStore,
 }
 
 impl TelegramTrigger {
@@ -375,8 +450,9 @@ impl TelegramTrigger {
         cache: MessageCache,
         expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
         telegram_dir: PathBuf,
+        thread_chat_map: ThreadChatMap,
     ) -> Self {
-        std::fs::create_dir_all(telegram_dir.join("updates")).ok();
+        std::fs::create_dir_all(&telegram_dir).ok();
         Self {
             host,
             agent,
@@ -385,7 +461,14 @@ impl TelegramTrigger {
             cache,
             expiry_rx,
             telegram_dir,
+            thread_chat_map,
+            updates: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    pub async fn load_history(&mut self) {
+        let store = load_updates(&self.telegram_dir).await;
+        self.updates = store;
     }
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -397,6 +480,8 @@ impl TelegramTrigger {
         let host = self.host;
         let chat_senders: ChatSenders = Arc::new(Mutex::new(HashMap::new()));
         let telegram_dir = self.telegram_dir;
+        let thread_chat_map = self.thread_chat_map;
+        let updates = self.updates;
 
         if let Some(mut rx) = self.expiry_rx {
             let expiry_agent = agent.clone();
@@ -423,7 +508,9 @@ impl TelegramTrigger {
             cache,
             host,
             chat_senders,
-            telegram_dir
+            telegram_dir,
+            thread_chat_map,
+            updates
         ];
 
         info!("starting Telegram bot dispatcher");

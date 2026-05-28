@@ -10,7 +10,11 @@ telegram-host = { path = "../telegram-host" }
 teloxide = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_path = "0.7"
+chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 data-buffer = { path = "../data-buffer" }
+regex = "1"
+uuid = { workspace = true }

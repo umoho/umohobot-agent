@@ -8,6 +8,10 @@ pub use edit::*;
 pub use query::*;
 pub use send::*;
 
+use std::sync::Arc;
+
+use agent::AgentHandle;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
     #[error("Telegram error: {0}")]
@@ -22,6 +26,10 @@ pub enum ToolError {
     JsonParse(#[from] serde_json::Error),
     #[error("Invalid dice emoji: {0}")]
     InvalidDiceEmoji(String),
+    #[error("Query tools require an active chat context")]
+    NotInAgentContext,
+    #[error("Chat not found for the current thread")]
+    ChatNotFound,
 }
 
 use teloxide::types::{FileId, InputFile};
@@ -53,14 +61,17 @@ pub(crate) fn parse_dice_emoji(s: &str) -> Option<DiceEmoji> {
 }
 
 use agent::{AgentError, AgentRuntime};
-use telegram_host::{MessageCache, TelegramHost};
+use telegram_host::{MessageCache, TelegramHost, ThreadChatMap, UpdateStore};
 pub async fn register_telegram_tools(
     runtime: &AgentRuntime,
     host: TelegramHost,
     cache: MessageCache,
+    updates: UpdateStore,
+    thread_chat_map: ThreadChatMap,
+    agent: Arc<dyn AgentHandle>,
 ) -> Result<(), AgentError> {
     send::register_send_tools(runtime, host.clone()).await?;
     edit::register_edit_tools(runtime, host.clone()).await?;
-    query::register_query_tools(runtime, host, cache).await?;
+    query::register_query_tools(runtime, host, cache, updates, thread_chat_map, agent).await?;
     Ok(())
 }

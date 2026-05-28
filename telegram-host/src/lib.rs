@@ -2,10 +2,20 @@ mod cache;
 
 pub use cache::MessageCache;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::Value;
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
 use teloxide::Bot;
 use teloxide::prelude::Requester;
 use teloxide::types::{ChatId, FileId, Message, MessageId};
 use tracing::debug;
+
+pub type ThreadChatMap = Arc<RwLock<HashMap<Uuid, i64>>>;
+pub type UpdateStore = Arc<RwLock<HashMap<i64, Vec<(i64, Value)>>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TelegramError {
@@ -19,19 +29,22 @@ pub enum TelegramError {
 pub struct TelegramHost {
     bot: Bot,
     token: String,
+    bot_id: i64,
 }
 
 impl TelegramHost {
-    pub fn new(token: impl Into<String>) -> Self {
+    pub async fn new(token: impl Into<String>) -> Self {
         let token = token.into();
         let bot = Bot::new(&token);
-        Self { bot, token }
+        let bot_id = bot.get_me().await.map(|u| u.id.0 as i64).unwrap_or(0);
+        Self { bot, token, bot_id }
     }
 
-    pub fn from_env() -> Self {
+    pub async fn from_env() -> Self {
         let bot = Bot::from_env();
         let token = bot.token().to_owned();
-        Self { bot, token }
+        let bot_id = bot.get_me().await.map(|u| u.id.0 as i64).unwrap_or(0);
+        Self { bot, token, bot_id }
     }
 
     pub fn bot(&self) -> &Bot {
@@ -40,6 +53,10 @@ impl TelegramHost {
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn bot_id(&self) -> i64 {
+        self.bot_id
     }
 
     pub async fn download_file_base64(&self, file_id: &FileId) -> Result<String, TelegramError> {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use agent::{AgentBuilder, ConfigFile, FileStorage, ModelPool, Storage};
 use data_buffer::DataBuffer;
-use telegram_host::{MessageCache, TelegramHost};
+use telegram_host::{MessageCache, TelegramHost, ThreadChatMap, UpdateStore};
 use tools_image::ocr::{ImageOcrTool, ocrs::OcrsBackend};
 use tools_subagent::register_subagent_tools;
 use tools_telegram::{TelegramDownloadTool, register_telegram_tools};
@@ -89,13 +89,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "starting umohobot"
     );
 
-    let telegram_host = TelegramHost::new(&cli.telegram_token);
+    let telegram_host = TelegramHost::new(&cli.telegram_token).await;
 
     let cache = MessageCache::new(200);
 
     let data_buffer = DataBuffer::new();
 
-    register_telegram_tools(agent_runtime.as_ref(), telegram_host.clone(), cache.clone()).await?;
+    let thread_chat_map: ThreadChatMap =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let updates: UpdateStore = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    register_telegram_tools(
+        agent_runtime.as_ref(),
+        telegram_host.clone(),
+        cache.clone(),
+        updates.clone(),
+        thread_chat_map.clone(),
+        agent_runtime.clone() as Arc<dyn agent::AgentHandle>,
+    )
+    .await?;
 
     agent_runtime.register_tool(WebScrapeTool).await?;
     agent_runtime.register_tool(WebFetchTool).await?;
@@ -125,14 +137,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         available_models: model_pool.available_models(),
     };
 
-    let trigger = TelegramTrigger::new(
+    let telegram_dir: std::path::PathBuf =
+        format!("data/telegram/bot-{}", telegram_host.bot_id()).into();
+
+    let mut trigger = TelegramTrigger::new(
         telegram_host,
         agent_runtime.clone(),
         config,
         cache,
         Some(expiry_rx),
-        "data/telegram".into(),
+        telegram_dir,
+        thread_chat_map,
     );
 
+    trigger.load_history().await;
     trigger.start().await
 }
