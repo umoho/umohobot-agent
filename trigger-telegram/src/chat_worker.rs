@@ -94,7 +94,6 @@ async fn chat_worker(
                 let resolve = resolve_thread(
                     chat_id,
                     &system_prompt,
-                    &config.compact_prompt,
                     &models_str,
                     &chat_map,
                     &*agent,
@@ -120,7 +119,6 @@ async fn chat_worker(
         let resolve = resolve_thread(
             chat_id,
             &system_prompt,
-            &config.compact_prompt,
             &models_str,
             &chat_map,
             &*agent,
@@ -155,7 +153,7 @@ pub(crate) async fn run_compact_and_turn(
         if let Ok(msgs) = agent.get_thread_messages(old_id).await {
             let text = compact_format::format_for_compact(&msgs);
             if let Ok(summary) = agent
-                .compact_thread(&text, old_id, resolve.thread_id, &config.compact_prompt)
+                .compact_thread(&text, old_id, resolve.thread_id, crate::COMPACT_PROMPT)
                 .await
             {
                 if !summary.is_empty() && summary != "无" {

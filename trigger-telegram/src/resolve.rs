@@ -29,7 +29,6 @@ pub(crate) struct ResolveResult {
 pub(crate) async fn resolve_thread(
     chat_id: ChatId,
     system_prompt: &str,
-    _compact_prompt: &str,
     format_available_models: &str,
     chat_map: &ChatMap,
     agent: &dyn AgentHandle,

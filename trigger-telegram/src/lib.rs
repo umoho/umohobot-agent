@@ -343,7 +343,6 @@ pub struct TriggerConfig {
     pub idle_timeout: Duration,
     pub max_thread_length: usize,
     pub system_prompt: String,
-    pub compact_prompt: String,
     pub available_models: Vec<agent::ModelInfo>,
 }
 
@@ -353,7 +352,6 @@ impl Default for TriggerConfig {
             idle_timeout: Duration::seconds(300),
             max_thread_length: 100,
             system_prompt: "You are a helpful Telegram bot.".into(),
-            compact_prompt: COMPACT_PROMPT.into(),
             available_models: Vec::new(),
         }
     }
