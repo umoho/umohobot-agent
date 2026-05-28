@@ -356,43 +356,79 @@ impl Default for TriggerConfig {
     }
 }
 
-async fn load_updates(telegram_dir: &PathBuf) -> UpdateStore {
-    let store: UpdateStore = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
-    let dir = tokio::fs::read_dir(telegram_dir).await;
-    let Ok(mut dir) = dir else {
-        return store;
-    };
+pub struct TelegramTrigger {
+    host: TelegramHost,
+    agent: Arc<dyn agent::AgentHandle>,
+    config: TriggerConfig,
+    chat_map: ChatMap,
+    cache: MessageCache,
+    expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
+    telegram_dir: PathBuf,
+    thread_chat_map: ThreadChatMap,
+    updates: UpdateStore,
+}
 
-    let mut entries = Vec::new();
-    while let Ok(Some(entry)) = dir.next_entry().await {
-        entries.push(entry);
+impl TelegramTrigger {
+    pub fn new(
+        host: TelegramHost,
+        agent: Arc<dyn agent::AgentHandle>,
+        config: TriggerConfig,
+        cache: MessageCache,
+        expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
+        telegram_dir: PathBuf,
+        thread_chat_map: ThreadChatMap,
+        updates: UpdateStore,
+    ) -> Self {
+        std::fs::create_dir_all(&telegram_dir).ok();
+        Self {
+            host,
+            agent,
+            config,
+            chat_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            cache,
+            expiry_rx,
+            telegram_dir,
+            thread_chat_map,
+            updates,
+        }
     }
 
-    let mut load_tasks = Vec::new();
-    for entry in entries {
-        let dir_name = entry.file_name();
-        let name = dir_name.to_string_lossy();
-        if !name.starts_with("chat-")
-            || !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
-        {
-            continue;
-        }
-        let chat_id_str = name.strip_prefix("chat-").unwrap_or("");
-        let Ok(chat_id) = chat_id_str.parse::<i64>() else {
-            continue;
+    pub fn updates_handle(&self) -> UpdateStore {
+        self.updates.clone()
+    }
+
+    pub async fn load_history(&self) {
+        let dir = match tokio::fs::read_dir(&self.telegram_dir).await {
+            Ok(d) => d,
+            Err(_) => return,
         };
 
-        let path = entry.path();
-        let store_clone = store.clone();
-        load_tasks.push(tokio::spawn(async move {
-            let mut dir_reader = match tokio::fs::read_dir(&path).await {
-                Ok(r) => r,
-                Err(_) => return,
+        let mut entries = Vec::new();
+        let mut dir = dir;
+        while let Ok(Some(entry)) = dir.next_entry().await {
+            entries.push(entry);
+        }
+
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("chat-") {
+                continue;
+            }
+            if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let chat_id_str = name.strip_prefix("chat-").unwrap_or("");
+            let Ok(chat_id) = chat_id_str.parse::<i64>() else {
+                continue;
             };
+
             let mut batch = Vec::new();
+            let mut dir_reader = match tokio::fs::read_dir(entry.path()).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
             while let Ok(Some(file)) = dir_reader.next_entry().await {
-                let fname = file.file_name();
-                let fname = fname.to_string_lossy();
+                let fname = file.file_name().to_string_lossy().to_string();
                 if !fname.starts_with("update-") || !fname.ends_with(".json") {
                     continue;
                 }
@@ -415,60 +451,14 @@ async fn load_updates(telegram_dir: &PathBuf) -> UpdateStore {
             }
 
             batch.sort_by_key(|(id, _)| *id);
-
-            let mut store = store_clone.write().await;
+            let mut store = self.updates.write().await;
             store.insert(chat_id, batch);
-        }));
-    }
-
-    for task in load_tasks {
-        let _ = task.await;
-    }
-
-    info!("loaded updates for {} chats", store.read().await.len());
-
-    store
-}
-
-pub struct TelegramTrigger {
-    host: TelegramHost,
-    agent: Arc<dyn agent::AgentHandle>,
-    config: TriggerConfig,
-    chat_map: ChatMap,
-    cache: MessageCache,
-    expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
-    telegram_dir: PathBuf,
-    thread_chat_map: ThreadChatMap,
-    updates: UpdateStore,
-}
-
-impl TelegramTrigger {
-    pub fn new(
-        host: TelegramHost,
-        agent: Arc<dyn agent::AgentHandle>,
-        config: TriggerConfig,
-        cache: MessageCache,
-        expiry_rx: Option<mpsc::UnboundedReceiver<TimerExpiry>>,
-        telegram_dir: PathBuf,
-        thread_chat_map: ThreadChatMap,
-    ) -> Self {
-        std::fs::create_dir_all(&telegram_dir).ok();
-        Self {
-            host,
-            agent,
-            config,
-            chat_map: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            cache,
-            expiry_rx,
-            telegram_dir,
-            thread_chat_map,
-            updates: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
-    }
 
-    pub async fn load_history(&mut self) {
-        let store = load_updates(&self.telegram_dir).await;
-        self.updates = store;
+        info!(
+            "loaded updates for {} chats",
+            self.updates.read().await.len()
+        );
     }
 
     pub async fn start(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

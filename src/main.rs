@@ -99,13 +99,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let updates: UpdateStore = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
 
+    let agent_handle = agent_runtime.clone() as Arc<dyn agent::AgentHandle>;
+
     register_telegram_tools(
         agent_runtime.as_ref(),
         telegram_host.clone(),
         cache.clone(),
         updates.clone(),
         thread_chat_map.clone(),
-        agent_runtime.clone() as Arc<dyn agent::AgentHandle>,
+        agent_handle,
     )
     .await?;
 
@@ -140,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let telegram_dir: std::path::PathBuf =
         format!("data/telegram/bot-{}", telegram_host.bot_id()).into();
 
-    let mut trigger = TelegramTrigger::new(
+    let trigger = TelegramTrigger::new(
         telegram_host,
         agent_runtime.clone(),
         config,
@@ -148,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(expiry_rx),
         telegram_dir,
         thread_chat_map,
+        updates,
     );
 
     trigger.load_history().await;
